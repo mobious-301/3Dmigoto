@@ -3893,16 +3893,18 @@ public:
 				sprintf(buffer, "  %s = %s;\n", writeTarget(dst), translated[0].c_str());
 				appendOutput(buffer);
 			} else {
+				DeferredWrite result = deferWrite(dst);
 				stripMask(dst);
 				for (int component = 0; component < 4; component++) {
 					if (!(dst0.ui32CompMask & (1 << component)))
 						continue;
 					sprintf(buffer, "  %s.%c = %s;\n",
-							writeTarget(dst),
+							result.temporary.c_str(),
 							component == 3 ? 'w' : 'x' + component,
 							translated[component].c_str());
 					appendOutput(buffer);
 				}
+				commitWrite(result);
 			}
 		}
 
@@ -4056,6 +4058,45 @@ public:
 		return 0;
 	}
 	//dx9
+
+	struct DeferredWrite
+	{
+		string target;
+		string temporary;
+		string mask;
+	};
+
+	// DXBC reads all sources before writing any destination. Instructions expanded
+	// into several statements must finish their calculations before committing
+	// results, including when another destination aliases a source.
+	DeferredWrite deferWrite(const string &target, const char *type = "float4")
+	{
+		char destination[opcodeSize];
+		strcpy_s(destination, opcodeSize, target.c_str());
+		remapTarget(destination);
+		const char *mask = strrchr(destination, '.');
+		DeferredWrite result;
+		result.mask = mask ? mask : ".xyzw";
+		result.target = mask ? string(destination, mask - destination) : destination;
+		result.temporary = "instructionResult" + to_string(uuidVar++);
+		char buffer[512];
+		sprintf(buffer, "  %s %s;\n", type, result.temporary.c_str());
+		appendOutput(buffer);
+		return result;
+	}
+
+	void commitWrite(const DeferredWrite &result)
+	{
+		// Preserve output registers split across multiple HLSL parameters.
+		for (size_t i = 1; i < result.mask.size(); ++i)
+		{
+			char target[opcodeSize], buffer[512];
+			sprintf(target, "%s.%c", result.target.c_str(), result.mask[i]);
+			sprintf(buffer, "  %s = %s.%c;\n", writeTarget(target),
+				result.temporary.c_str(), result.mask[i]);
+			appendOutput(buffer);
+		}
+	}
 
 	void ParseCode(Shader *shader, const char *c, size_t size)
 	{
@@ -4986,22 +5027,24 @@ public:
 						applySwizzle(op1, op2);	// width
 						applySwizzle(op1, op3); // offset
 						applySwizzle(op1, op4);
+						DeferredWrite result = deferWrite(op1, "uint4");
 						int idx = 0;
 						char *pop1 = strrchr(op1, '.'); *pop1 = 0;
 						while (*++pop1)
 						{
-							sprintf(op5, "%s.%c", op1, *pop1);
+							sprintf(op5, "%s.%c", result.temporary.c_str(), *pop1);
 							sprintf(buffer, "  if (%s == 0) %s = 0; else if (%s+%s < 32) { ",
 								ci(GetSuffix(op2, idx)).c_str(), writeTarget(op5), ci(GetSuffix(op2, idx)).c_str(), ci(GetSuffix(op3, idx)).c_str());
 							appendOutput(buffer);
 							// FIXME: May need fixup for read from constant buffer of unidentified type?
-							sprintf(buffer, "%s = (uint)%s << (32-(%s + %s)); %s = (uint)%s >> (32-%s); ", writeTarget(op5), ci(GetSuffix(op4, idx)).c_str(), ci(GetSuffix(op2, idx)).c_str(), ci(GetSuffix(op3, idx)).c_str(), writeTarget(op5), writeTarget(op5), ci(GetSuffix(op2, idx)).c_str());
+							sprintf(buffer, "%s = (uint)%s << (32-((uint)%s + (uint)%s)); %s = (uint)%s >> (32-(uint)%s); ", writeTarget(op5), ci(GetSuffix(op4, idx)).c_str(), ci(GetSuffix(op2, idx)).c_str(), ci(GetSuffix(op3, idx)).c_str(), writeTarget(op5), writeTarget(op5), ci(GetSuffix(op2, idx)).c_str());
 							appendOutput(buffer);
-							sprintf(buffer, " } else %s = (uint)%s >> %s;\n",
+							sprintf(buffer, " } else %s = (uint)%s >> (uint)%s;\n",
 								writeTarget(op5), ci(GetSuffix(op4, idx)).c_str(), ci(GetSuffix(op3, idx)).c_str());
 							appendOutput(buffer);
 							++idx;
 						}
+						commitWrite(result);
 						break;
 					}
 
@@ -5971,14 +6014,16 @@ public:
 						applySwizzle(op1, op3);
 						applySwizzle(op1, op4);
 						applySwizzle(op1, op5);
+						DeferredWrite first = deferWrite(op1);
+						DeferredWrite second = deferWrite(op2);
 						int idx = 0;
 						char *pop1 = strrchr(op1, '.'); *pop1 = 0;
 						char *pop2 = strrchr(op2, '.'); if (pop2) *pop2 = 0;
 						char *pop3 = strrchr(op3, '.'); if (pop3) *pop3 = 0;
 						while (*++pop1)
 						{
-							sprintf(op6, "%s.%c", op1, *pop1);
-							if (pop2) sprintf(op7, "%s.%c", op2, *++pop2); else sprintf(op7, "%s", op2);
+							sprintf(op6, "%s.%c", first.temporary.c_str(), *pop1);
+							if (pop2) sprintf(op7, "%s.%c", second.temporary.c_str(), *++pop2); else sprintf(op7, "%s", op2);
 							if (pop3) sprintf(op8, "%s.%c", op3, *++pop3); else sprintf(op8, "%s", op3);
 							// FIXME: May need fixup for read from constant buffer of unidentified type
 							sprintf(buffer, "  %s = (int)%s ? %s : %s; %s = (int)%s ? %s : %s;\n",
@@ -5987,6 +6032,8 @@ public:
 							appendOutput(buffer);
 							++idx;
 						}
+						commitWrite(first);
+						commitWrite(second);
 						break;
 					}
 
@@ -6003,22 +6050,24 @@ public:
 						applySwizzle(op1, op3);
 						applySwizzle(op1, op4);
 						applySwizzle(op1, op5);
+						DeferredWrite result = deferWrite(op1, "uint4");
 						int idx = 0;
 						char *pop1 = strrchr(op1, '.'); *pop1 = 0;
 						while (*++pop1)
 						{
-							sprintf(op6, "%s.%c", op1, *pop1);
+							sprintf(op6, "%s.%c", result.temporary.c_str(), *pop1);
 
 							// Fails: bitmask.%c = (((1 << %s) - 1) << %s) & 0xffffffff;
 
 							// FIXME: May need fixup for read from constant buffer of unidentified type
-							sprintf(buffer, "  bitmask.%c = ((~(-1 << %s)) << %s) & 0xffffffff;"
-								"  %s = (((uint)%s << %s) & bitmask.%c) | ((uint)%s & ~bitmask.%c);\n",
+							sprintf(buffer, "  bitmask.%c = ((~(-1 << (uint)%s)) << (uint)%s) & 0xffffffff;"
+								"  %s = (((uint)%s << (uint)%s) & bitmask.%c) | ((uint)%s & ~bitmask.%c);\n",
 								*pop1, ci(GetSuffix(op2, idx)).c_str(), ci(GetSuffix(op3, idx)).c_str(),
 								writeTarget(op6), ci(GetSuffix(op4, idx)).c_str(), ci(GetSuffix(op3, idx)).c_str(), *pop1, ci(GetSuffix(op5, idx)).c_str(), *pop1);
 							appendOutput(buffer);
 							++idx;
 						}
+						commitWrite(result);
 						break;
 					}
 
