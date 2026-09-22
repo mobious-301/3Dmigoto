@@ -4527,11 +4527,54 @@ public:
 						logDecompileError("Error parsing texture register index: " + string(op2));
 						return;
 					}
+					// These typed declarations take precedence over reflected element types.
+					// In particular, a typed buffer must not become a StructuredBuffer.
+					string typedBuffer;
+					if (!strcmp(op1, "(float,float,float,float)"))
+						typedBuffer = "Buffer<float4>";
+					else if (!strcmp(op1, "(uint,uint,uint,uint)"))
+						typedBuffer = "Buffer<uint4>";
+
 					// Create if not existing.  e.g. if no ResourceBinding section in ASM.
 					map<int, string>::iterator i = mTextureNames.find(bufIndex);
 					if (i == mTextureNames.end())
 					{
 						CreateRawFormat("Buffer", bufIndex);
+					}
+					else if (!typedBuffer.empty())
+					{
+						// Resource definitions have already been written. Update the type
+						// in both the declaration and the lookup used by load instructions.
+						int declarationSlot = bufIndex;
+						for (map<int, int>::iterator a = mTextureNamesArraySize.begin();
+							a != mTextureNamesArraySize.end(); ++a)
+						{
+							if (a->second > 1 && bufIndex >= a->first && bufIndex - a->first < a->second)
+							{
+								declarationSlot = a->first;
+								break;
+							}
+						}
+						const string oldType = mTextureType[declarationSlot];
+						if (oldType != typedBuffer)
+						{
+							const string name = mTextureNames[declarationSlot];
+							const string baseName = name.substr(0, name.find('['));
+							const string suffix = mTextureNamesArraySize[declarationSlot] > 1 ? "[" : " :";
+							const string declaration = "\n" + oldType + " " + baseName + suffix;
+							const string header = "\n" + string(mOutput.begin(), mOutput.begin() + mCodeStartPos);
+							const size_t typePos = header.find(declaration);
+							if (typePos == string::npos)
+							{
+								logDecompileError("Cannot update typed buffer declaration: " + baseName);
+								return;
+							}
+							mOutput.erase(mOutput.begin() + typePos, mOutput.begin() + typePos + oldType.size());
+							mOutput.insert(mOutput.begin() + typePos, typedBuffer.begin(), typedBuffer.end());
+							mCodeStartPos = mCodeStartPos - oldType.size() + typedBuffer.size();
+							mTextureType[declarationSlot] = typedBuffer;
+						}
+						mTextureType[bufIndex] = typedBuffer;
 					}
 				}
 			}
