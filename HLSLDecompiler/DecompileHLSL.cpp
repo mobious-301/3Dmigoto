@@ -3789,10 +3789,10 @@ public:
 			// type information instead. Our fake type information is
 			// an array of floats for the greatest compatibility with
 			// any possible stride value that StructuredBuffers may posess,
-			// but that means we have to break up instructions to assign
-			// each component in the mask separately, adjusting the offset
-			// based on the swizzle. TODO: We could recombine them using
-			// a floatN(x,y,z,w); construct. We can't fix up types that
+			// but that means we have to calculate each component in the mask
+			// separately, adjusting the offset based on the swizzle. The caller
+			// recombines these expressions into a floatN(x,y,z,w) assignment.
+			// We can't fix up types that
 			// aren't floats here, because we won't know what types they
 			// are until they are used - ideally we should switch to a
 			// model that uses asfloat/asint where non-floats are used
@@ -3892,7 +3892,7 @@ public:
 			if (combined) {
 				sprintf(buffer, "  %s = %s;\n", writeTarget(dst), translated[0].c_str());
 				appendOutput(buffer);
-			} else {
+			} else if (!writeStructuredComponents(dst, translated, dst0.ui32CompMask)) {
 				DeferredWrite result = deferWrite(dst);
 				stripMask(dst);
 				for (int component = 0; component < 4; component++) {
@@ -4096,6 +4096,59 @@ public:
 				result.temporary.c_str(), result.mask[i]);
 			appendOutput(buffer);
 		}
+	}
+
+	// Recombine a structured load that was split into per-component expressions.
+	// This keeps the generated HLSL compact while preserving DXBC's read-before-
+	// write behavior when the destination aliases the index register.
+	bool writeStructuredComponents(const char *destination, const string translated[4], unsigned mask)
+	{
+		const char *maskText = strrchr(destination, '.');
+		if (!maskText)
+			return false;
+
+		string target(destination, maskText - destination);
+		string components(maskText + 1);
+		string vectorTarget = target + "." + components;
+
+		// A whole-vector remap is safe. If only individual components are
+		// remapped, keep the DeferredWrite path because those components may
+		// belong to different output registers.
+		StringStringMap::iterator remapped = mRemappedOutputRegisters.find(vectorTarget);
+		if (remapped != mRemappedOutputRegisters.end())
+			vectorTarget = remapped->second;
+		else
+		{
+			for (size_t i = 0; i < components.size(); ++i)
+			{
+				string componentTarget = target + "." + components[i];
+				if (mRemappedOutputRegisters.find(componentTarget) != mRemappedOutputRegisters.end())
+					return false;
+			}
+		}
+
+		string values;
+		int componentCount = 0;
+		for (int component = 0; component < 4; ++component)
+		{
+			if (!(mask & (1 << component)))
+				continue;
+			if (!values.empty())
+				values += ", ";
+			values += translated[component];
+			++componentCount;
+		}
+
+		if (!componentCount)
+			return false;
+
+		string expression = componentCount == 1
+			? values
+			: "float" + to_string(componentCount) + "(" + values + ")";
+		char buffer[opcodeSize * 8];
+		sprintf(buffer, "  %s = %s;\n", vectorTarget.c_str(), expression.c_str());
+		appendOutput(buffer);
+		return true;
 	}
 
 	void ParseCode(Shader *shader, const char *c, size_t size)
