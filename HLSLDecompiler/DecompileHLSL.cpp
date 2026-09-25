@@ -2754,6 +2754,56 @@ public:
 		return _convertToUInt(target, false);
 	}
 
+	// For a masked destination, DXBC source swizzles are indexed by the
+	// physical destination lane.  A destination of .yzw therefore consumes
+	// source/literal lanes y, z and w, not the compact x, y and z sequence.
+	// Build each lane independently so aliases such as r0.yzw = imin(r0.yyzw,
+	// l(0,31,15,23)) are read before the write and retain the literal mapping.
+	string integerLaneOperand(const char *source, int lane, bool unsignedValue)
+	{
+		char left[8];
+		char value[opcodeSize];
+		sprintf_s(left, sizeof(left), ".%c", "xyzw"[lane]);
+		strcpy_s(value, opcodeSize, source);
+		applySwizzle(left, value, true);
+		if (unsignedValue)
+			convertToUInt(value);
+		else
+			convertToInt(value);
+		return value;
+	}
+
+	string integerMinMaxExpression(const char *destination, const char *source0, const char *source1,
+		bool unsignedValue, bool maximum)
+	{
+		const char *mask = strrchr(destination, '.');
+		string lanes = mask ? mask + 1 : "xyzw";
+		string lhs, rhs;
+
+		for (size_t i = 0; i < lanes.size(); ++i)
+		{
+			int lane = (int)lanes[i] - 'x';
+			if (lane < 0 || lane > 3)
+				continue;
+			if (!lhs.empty())
+			{
+				lhs += ", ";
+				rhs += ", ";
+			}
+			lhs += integerLaneOperand(source0, lane, unsignedValue);
+			rhs += integerLaneOperand(source1, lane, unsignedValue);
+		}
+
+		if (lanes.size() > 1)
+		{
+			string type = unsignedValue ? "uint" : "int";
+			lhs = type + to_string(lanes.size()) + "(" + lhs + ")";
+			rhs = type + to_string(lanes.size()) + "(" + rhs + ")";
+		}
+
+		return string(maximum ? "max(" : "min(") + lhs + ", " + rhs + ")";
+	}
+
 	// DXBC bitwise instructions operate on the raw 32-bit register contents.
 	// The decompiler keeps temporary registers as float4 for compatibility with
 	// the rest of the generated shader, so numeric casts are not sufficient here:
@@ -5258,25 +5308,31 @@ public:
 						removeBoolean(op1);
 						break;
 
-						// Missing opcode for UMin, used in Dragon Age
+					// Missing opcode for UMin, used in Dragon Age
 					case OPCODE_UMIN:
+					{
 						remapTarget(op1);
-						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
-						applySwizzle(op1, fixImm(op3, instr->asOperands[2]));
-						sprintf(buffer, "  %s = min(%s, %s);\n", writeTarget(op1), ci(convertToUInt(op3)).c_str(), ci(convertToUInt(op2)).c_str());
+						char *source0 = fixImm(op2, instr->asOperands[1]);
+						char *source1 = fixImm(op3, instr->asOperands[2]);
+						string expression = integerMinMaxExpression(op1, source0, source1, true, false);
+						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
+					}
 
-						// Missing opcode for UMax, used in Witcher3
+					// Missing opcode for UMax, used in Witcher3
 					case OPCODE_UMAX:
+					{
 						remapTarget(op1);
-						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
-						applySwizzle(op1, fixImm(op3, instr->asOperands[2]));
-						sprintf(buffer, "  %s = max(%s, %s);\n", writeTarget(op1), ci(convertToUInt(op3)).c_str(), ci(convertToUInt(op2)).c_str());
+						char *source0 = fixImm(op2, instr->asOperands[1]);
+						char *source1 = fixImm(op3, instr->asOperands[2]);
+						string expression = integerMinMaxExpression(op1, source0, source1, true, true);
+						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
+					}
 
 						// Add remaining atomic ops, we see atomic_or in Song of the Deep.
 						// Needs an unclear manual fix, but better than not generating any HLSL at all.
@@ -5525,27 +5581,31 @@ public:
 						break;
 					}
 					case OPCODE_IMIN:
+					{
 						remapTarget(op1);
-						applySwizzle(op1, fixImm(op2, instr->asOperands[1]), true);
-						applySwizzle(op1, fixImm(op3, instr->asOperands[2]), true);
-						if (!instr->bSaturate)
-							sprintf(buffer, "  %s = min(%s, %s);\n", writeTarget(op1), ci(convertToInt(op3)).c_str(), ci(convertToInt(op2)).c_str());
-						else
-							sprintf(buffer, "  %s = saturate(min(%s, %s));\n", writeTarget(op1), ci(convertToInt(op3)).c_str(), ci(convertToInt(op2)).c_str());
+						char *source0 = fixImm(op2, instr->asOperands[1]);
+						char *source1 = fixImm(op3, instr->asOperands[2]);
+						string expression = integerMinMaxExpression(op1, source0, source1, false, false);
+						if (instr->bSaturate)
+							expression = "saturate(" + expression + ")";
+						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
+					}
 					case OPCODE_IMAX:
+					{
 						remapTarget(op1);
-						applySwizzle(op1, fixImm(op2, instr->asOperands[1]), true);
-						applySwizzle(op1, fixImm(op3, instr->asOperands[2]), true);
-						if (!instr->bSaturate)
-							sprintf(buffer, "  %s = max(%s, %s);\n", writeTarget(op1), ci(convertToInt(op3)).c_str(), ci(convertToInt(op2)).c_str());
-						else
-							sprintf(buffer, "  %s = saturate(max(%s, %s));\n", writeTarget(op1), ci(convertToInt(op3)).c_str(), ci(convertToInt(op2)).c_str());
+						char *source0 = fixImm(op2, instr->asOperands[1]);
+						char *source1 = fixImm(op3, instr->asOperands[2]);
+						string expression = integerMinMaxExpression(op1, source0, source1, false, true);
+						if (instr->bSaturate)
+							expression = "saturate(" + expression + ")";
+						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
+					}
 
 					case OPCODE_MAD:
 						remapTarget(op1);
