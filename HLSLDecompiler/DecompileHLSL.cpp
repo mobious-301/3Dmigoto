@@ -3325,6 +3325,25 @@ public:
 		return true;
 	}
 
+	void emitTextureLoad(char *target, int textureId, const char *expression)
+	{
+		const string &type = mTextureType[textureId];
+		bool unsignedValue = type.find("<uint") != string::npos;
+		bool integerValue = unsignedValue || type.find("<int") != string::npos;
+		if (integerValue)
+		{
+			markIntegerBitPatternComponents(target);
+			if (emitIntegerAssignment(target, expression, unsignedValue))
+				return;
+		}
+		char assignment[opcodeSize * 2];
+		if (integerValue)
+			sprintf(assignment, "  %s = asfloat(%s);\n", writeTarget(target), expression);
+		else
+			sprintf(assignment, "  %s = %s;\n", writeTarget(target), expression);
+		appendOutput(assignment);
+	}
+
 	// DXBC bitwise instructions operate on the raw 32-bit register contents.
 	// The decompiler keeps temporary registers as float4 for compatibility with
 	// the rest of the generated shader, so numeric casts are not sufficient here:
@@ -3454,9 +3473,16 @@ public:
 
 	string conditionExpression(char *arg, bool testZero)
 	{
-		bool isMask = isBoolean(arg);
+		// DXBC tests the raw DWORD, including integers and comparison masks.
+		bool isMask = isBoolean(arg) || arg[0] == 'r';
 		string value = ci(arg);
-		if (isMask)
+		string alias = integerAliasForOperand(arg);
+		if (!alias.empty())
+		{
+			value = "asuint(" + alias + ")";
+			isMask = true;
+		}
+		else if (isMask)
 			value = "asuint(" + value + ")";
 		return "(" + value + (testZero ? " == " : " != ") + (isMask ? "0u" : "0") + ")";
 	}
@@ -4124,6 +4150,7 @@ public:
 		mTextureNames[bufIndex] = buffer;
 
 		sscanf_s(op1, "(%[^,]", format, 16);	// Match first xx of (xx,xx,xx,xx)
+		if (!strcmp(format, "sint")) strcpy_s(format, sizeof(format), "int");
 		string form4 = string(format) + "4";	// Grim. Known to fail sometimes.
 		mTextureType[bufIndex] = texType + "<" + form4 + ">";
 
@@ -5446,7 +5473,10 @@ public:
 				for (uint32_t read_index = 1; read_index < instr->ui32NumOperands && read_index <= 14; ++read_index)
 					preserveIntegerReadOperand(read_operands[read_index - 1]);
 
-				if (instr->eOpcode != OPCODE_LD_STRUCTURED && instr->ui32NumOperands && instr->asOperands[0].eType == OPERAND_TYPE_TEMP)
+				bool sourceOnly = instr->eOpcode == OPCODE_SWITCH || instr->eOpcode == OPCODE_IF ||
+					instr->eOpcode == OPCODE_BREAKC || instr->eOpcode == OPCODE_CONTINUEC ||
+					instr->eOpcode == OPCODE_RETC || instr->eOpcode == OPCODE_DISCARD;
+				if (!sourceOnly && instr->eOpcode != OPCODE_LD_STRUCTURED && instr->ui32NumOperands && instr->asOperands[0].eType == OPERAND_TYPE_TEMP)
 					invalidateIntegerAliases(op1);
 				switch (instr->eOpcode)
 				{
@@ -6917,18 +6947,25 @@ public:
 
 					// Switch statement in HLSL was missing. Added because AC4 uses it.
 					case OPCODE_SWITCH:
+						applySwizzle(".x", op1);
+						bitcastToUInt(op1);
 						sprintf(buffer, "  switch (%s) {\n", ci(op1).c_str());
 						appendOutput(buffer);
+						mIntegerAliases.clear();
 						break;
 					case OPCODE_CASE:
-						sprintf(buffer, "  case %s :", ci(op1).substr(2, 1).c_str());
+						mIntegerAliases.clear();
+						applySwizzle(".x", integerImmediate(op1, instr->asOperands[0]), true);
+						sprintf(buffer, "  case %s :", op1);
 						appendOutput(buffer);
 						break;
 					case OPCODE_ENDSWITCH:
+						mIntegerAliases.clear();
 						sprintf(buffer, "  }\n");
 						appendOutput(buffer);
 						break;
 					case OPCODE_DEFAULT:
+						mIntegerAliases.clear();
 						sprintf(buffer, "  default :\n");
 						appendOutput(buffer);
 						break;
@@ -7395,14 +7432,14 @@ public:
 						truncateTextureSwiz(op1, mTextureType[textureId].c_str());
 						truncateTextureSwiz(op3, mTextureType[textureId].c_str());
 						if (!instr->bAddressOffset)
-							sprintf(buffer, "  %s = %s.Load(%s)%s;\n", writeTarget(op1), mTextureNames[textureId].c_str(), ci(op2).c_str(), strrchr(op3, '.'));
+							sprintf(buffer, "%s.Load(%s)%s", mTextureNames[textureId].c_str(), ci(op2).c_str(), strrchr(op3, '.'));
 						else {
 							int offsetU = 0, offsetV = 0, offsetW = 0;
 							sscanf_s(statement, "ld_aoffimmi(%d,%d,%d", &offsetU, &offsetV, &offsetW);
-							sprintf(buffer, "  %s = %s.Load(%s, int3(%d, %d, %d))%s;\n", writeTarget(op1), mTextureNames[textureId].c_str(), ci(op2).c_str(),
+							sprintf(buffer, "%s.Load(%s, int3(%d, %d, %d))%s", mTextureNames[textureId].c_str(), ci(op2).c_str(),
 								offsetU, offsetV, offsetW, strrchr(op3, '.'));
 						}
-						appendOutput(buffer);
+						emitTextureLoad(op1, textureId, buffer);
 						removeBoolean(op1);
 						break;
 					}
@@ -7419,14 +7456,14 @@ public:
 						truncateTextureSwiz(op1, mTextureType[textureId].c_str());
 						truncateTextureSwiz(op3, mTextureType[textureId].c_str());
 						if (!instr->bAddressOffset)
-							sprintf(buffer, "  %s = %s.Load(%s, %s)%s;\n", writeTarget(op1), mTextureNames[textureId].c_str(), ci(op2).c_str(), ci(op4).c_str(), strrchr(op3, '.'));
+							sprintf(buffer, "%s.Load(%s, %s)%s", mTextureNames[textureId].c_str(), ci(op2).c_str(), ci(op4).c_str(), strrchr(op3, '.'));
 						else{
 							int offsetU = 0, offsetV = 0, offsetW = 0;
 							sscanf_s(statement, "ld_aoffimmi(%d,%d,%d", &offsetU, &offsetV, &offsetW);
-							sprintf(buffer, "  %s = %s.Load(%s, %s, int3(%d, %d, %d))%s;\n", writeTarget(op1), mTextureNames[textureId].c_str(), ci(op2).c_str(), ci(op4).c_str(),
+							sprintf(buffer, "%s.Load(%s, %s, int3(%d, %d, %d))%s", mTextureNames[textureId].c_str(), ci(op2).c_str(), ci(op4).c_str(),
 								offsetU, offsetV, offsetW, strrchr(op3, '.'));
 						}
-						appendOutput(buffer);
+						emitTextureLoad(op1, textureId, buffer);
 						removeBoolean(op1);
 						break;
 					}

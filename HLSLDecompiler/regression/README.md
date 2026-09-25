@@ -16,3 +16,17 @@ the untouched generated HLSL using FXC /O3. It checks the integer clamp,
 both mask words, unsigned conversions, and both dynamic t8 lookups inside
 loops, including their dependency into t6. Artifacts are kept in an ignored
 unique output directory for inspection.
+
+# Integer control and texture-load regression
+
+Run `./regression/integer_control.ps1` in an x64 MSVC developer shell after
+building cmd_Decompiler (the same executable override parameters apply).
+This requires the Windows SDK, FXC, and D3D11 WARP.
+
+The test assembles `fixtures/integer_control.asm`, decompiles it, and compiles
+the generated pixel shader with FXC /O3. A compute wrapper then executes the
+unchanged generated function body on WARP and checks four input sets against
+expected DWORDs. It covers tracked integer switch selectors, multi-digit case
+labels, raw nonzero conditions (including 0x80000000), scalar/vector UINT loads,
+and scalar SINT loads. This is a focused semantic regression, not a visual
+validation of the complete material shader.
