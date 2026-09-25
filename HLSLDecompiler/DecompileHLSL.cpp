@@ -3029,6 +3029,19 @@ public:
 	// l(0,31,15,23)) are read before the write and retain the literal mapping.
 	string integerLaneOperand(const char *source, int lane, bool unsignedValue)
 	{
+		if (!strncmp(source, "l(", 2))
+		{
+			// integerImmediate supplied exact decimal DWORDs. Select their
+			// text directly: applySwizzleLiteral parses through float and
+			// would round integers larger than 2^24.
+			string literal = source;
+			size_t start = 2;
+			if (literal.find(',') != string::npos)
+				for (int component = 0; component < lane; ++component)
+					start = literal.find(',', start) + 1;
+			string value = literal.substr(start, literal.find_first_of(",)", start) - start);
+			return unsignedValue ? "uint(" + value + ")" : value;
+		}
 		char left[8];
 		char value[opcodeSize];
 		sprintf_s(left, sizeof(left), ".%c", "xyzw"[lane]);
@@ -3325,7 +3338,7 @@ public:
 		string alias = integerAliasForOperand(target);
 		if (!alias.empty())
 		{
-			strcpy_s(target, opcodeSize, alias.c_str());
+			_snprintf_s(target, opcodeSize, opcodeSize, "asuint(%s)", alias.c_str());
 			return;
 		}
 		if (!strncmp(target, "uint", 4) ||
@@ -3346,7 +3359,7 @@ public:
 		string alias = integerAliasForOperand(target);
 		if (!alias.empty())
 		{
-			strcpy_s(target, opcodeSize, alias.c_str());
+			_snprintf_s(target, opcodeSize, opcodeSize, "asint(%s)", alias.c_str());
 			return;
 		}
 		if (!strncmp(target, "int", 3) ||
@@ -3468,6 +3481,23 @@ public:
 					sprintf_s(op, opcodeSize, "l(%.9g)", o.afImmediates[0]);
 			}
 		}
+		return op;
+	}
+
+	char *integerImmediate(char *op, const Operand &operand)
+	{
+		if (operand.eType != OPERAND_TYPE_IMMEDIATE32)
+			return op;
+		string literal = "l(";
+		for (int lane = 0; lane < operand.iNumComponents; ++lane)
+		{
+			int32_t bits;
+			memcpy(&bits, &operand.afImmediates[lane], sizeof(bits));
+			if (lane) literal += ",";
+			literal += to_string(bits);
+		}
+		literal += ")";
+		strcpy_s(op, opcodeSize, literal.c_str());
 		return op;
 	}
 
@@ -4318,6 +4348,19 @@ public:
 		applySwizzle(".x", off);
 		if (isIntegerBitPatternOperand(idx) || !integerAliasForOperand(idx).empty())
 			bitcastToUInt(idx);
+
+		// Resolve the old address before killing the actual destination.
+		// The text parser's op1 may be "stride=..." for indexable loads.
+		if (instr->eOpcode == OPCODE_LD_STRUCTURED && dst0.eType == OPERAND_TYPE_TEMP)
+		{
+			string destination = "r" + to_string(dst0.ui32RegisterNumber) + ".";
+			for (int lane = 0; lane < 4; ++lane)
+				if (dst0.ui32CompMask & (1u << lane)) destination += "xyzw"[lane];
+			invalidateIntegerAliases(destination.c_str());
+			// Even an unreflected float field is a raw DWORD when used by
+			// a subsequent integer consumer or resource address.
+			markIntegerBitPatternComponents(destination.c_str());
+		}
 
 		*combined = false;
 
@@ -5403,7 +5446,7 @@ public:
 				for (uint32_t read_index = 1; read_index < instr->ui32NumOperands && read_index <= 14; ++read_index)
 					preserveIntegerReadOperand(read_operands[read_index - 1]);
 
-				if (instr->ui32NumOperands && instr->asOperands[0].eType == OPERAND_TYPE_TEMP)
+				if (instr->eOpcode != OPCODE_LD_STRUCTURED && instr->ui32NumOperands && instr->asOperands[0].eType == OPERAND_TYPE_TEMP)
 					invalidateIntegerAliases(op1);
 				switch (instr->eOpcode)
 				{
@@ -6080,8 +6123,8 @@ public:
 					case OPCODE_UMIN:
 					{
 						remapTarget(op1);
-						char *source0 = fixImm(op2, instr->asOperands[1]);
-						char *source1 = fixImm(op3, instr->asOperands[2]);
+						char *source0 = integerImmediate(op2, instr->asOperands[1]);
+						char *source1 = integerImmediate(op3, instr->asOperands[2]);
 						string expression = integerMinMaxExpression(op1, source0, source1, true, false);
 						sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
@@ -6093,8 +6136,8 @@ public:
 					case OPCODE_UMAX:
 					{
 						remapTarget(op1);
-						char *source0 = fixImm(op2, instr->asOperands[1]);
-						char *source1 = fixImm(op3, instr->asOperands[2]);
+						char *source0 = integerImmediate(op2, instr->asOperands[1]);
+						char *source1 = integerImmediate(op3, instr->asOperands[2]);
 						string expression = integerMinMaxExpression(op1, source0, source1, true, true);
 						sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
@@ -6351,8 +6394,8 @@ public:
 					case OPCODE_IMIN:
 					{
 						remapTarget(op1);
-						char *source0 = fixImm(op2, instr->asOperands[1]);
-						char *source1 = fixImm(op3, instr->asOperands[2]);
+						char *source0 = integerImmediate(op2, instr->asOperands[1]);
+						char *source1 = integerImmediate(op3, instr->asOperands[2]);
 						string expression = integerMinMaxExpression(op1, source0, source1, false, false);
 						if (instr->bSaturate)
 							expression = "saturate(" + expression + ")";
@@ -6364,8 +6407,8 @@ public:
 					case OPCODE_IMAX:
 					{
 						remapTarget(op1);
-						char *source0 = fixImm(op2, instr->asOperands[1]);
-						char *source1 = fixImm(op3, instr->asOperands[2]);
+						char *source0 = integerImmediate(op2, instr->asOperands[1]);
+						char *source1 = integerImmediate(op3, instr->asOperands[2]);
 						string expression = integerMinMaxExpression(op1, source0, source1, false, true);
 						if (instr->bSaturate)
 							expression = "saturate(" + expression + ")";
@@ -6899,15 +6942,21 @@ public:
 						appendOutput(buffer);
 						break;
 					case OPCODE_ELSE:
+						mIntegerAliases.clear();
 						sprintf(buffer, "  } else {\n");
 						appendOutput(buffer);
 						break;
 					case OPCODE_ENDIF:
+						mIntegerAliases.clear();
 						sprintf(buffer, "  }\n");
 						appendOutput(buffer);
 						break;
 
 					case OPCODE_LOOP:
+						// A preheader alias does not describe later iterations.
+						// Use the register copy at joins until loop-carried values
+						// have a proper reaching-definition analysis.
+						mIntegerAliases.clear();
 						sprintf(buffer, "  while (true) {\n");
 						appendOutput(buffer);
 						break;
@@ -6936,6 +6985,7 @@ public:
 						appendOutput(buffer);
 						break;
 					case OPCODE_ENDLOOP:
+						mIntegerAliases.clear();
 						sprintf(buffer, "  }\n");
 						appendOutput(buffer);
 						break;
