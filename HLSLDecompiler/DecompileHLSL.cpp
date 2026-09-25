@@ -176,6 +176,8 @@ public:
 	StringStringMap mRemappedOutputRegisters;
 	vector<pair<string, string> > mRemappedInputRegisters;
 	set<string> mBooleanRegisters;
+	map<string, string> mIntegerAliases;
+	set<string> mDeclaredIntegerAliases;
 
 	DecompilerSettings *G;
 
@@ -3063,6 +3065,100 @@ public:
 		return string(maximum ? "max(" : "min(") + lhs + ", " + rhs + ")";
 	}
 
+	bool singleTempComponent(const char *operand, string &key, int &register_number, char &component)
+	{
+		const char *dot = strchr(operand, '.');
+		if (operand[0] != 'r' || !dot || !strchr("xyzw", dot[1]) || dot[2] != 0)
+			return false;
+		register_number = atoi(operand + 1);
+		component = dot[1];
+		key = operand;
+		return true;
+	}
+
+	string integerAliasForOperand(const char *operand)
+	{
+		string value = operand;
+		bool negative = false;
+		if (!value.empty() && value[0] == '-')
+		{
+			negative = true;
+			value.erase(0, 1);
+		}
+
+		map<string, string>::iterator exact = mIntegerAliases.find(value);
+		if (exact != mIntegerAliases.end())
+			return (negative ? "-" : "") + exact->second;
+
+		size_t dot = value.find('.');
+		if (dot == string::npos || value[0] != 'r')
+			return "";
+		string register_name = value.substr(0, dot);
+		string components = value.substr(dot + 1);
+		if (components.empty() || components.size() > 4)
+			return "";
+
+		string result;
+		for (size_t i = 0; i < components.size(); ++i)
+		{
+			if (!strchr("xyzw", components[i]))
+				return "";
+			string key = register_name + "." + components.substr(i, 1);
+			map<string, string>::iterator alias = mIntegerAliases.find(key);
+			if (alias == mIntegerAliases.end())
+				return "";
+			if (!result.empty())
+				result += ", ";
+			result += alias->second;
+		}
+		if (components.size() > 1)
+			result = "uint" + to_string(components.size()) + "(" + result + ")";
+		if (negative)
+			result = "-" + result;
+		return result;
+	}
+
+	void invalidateIntegerAliases(const char *operand)
+	{
+		const char *dot = strchr(operand, '.');
+		if (operand[0] != 'r')
+			return;
+		string register_name = dot ? string(operand, dot - operand) : string(operand);
+		if (!dot)
+		{
+			for (map<string, string>::iterator i = mIntegerAliases.begin(); i != mIntegerAliases.end(); )
+			{
+				if (i->first.compare(0, register_name.size(), register_name) == 0)
+					i = mIntegerAliases.erase(i);
+				else
+					++i;
+			}
+			return;
+		}
+		for (const char *component = dot + 1; *component; ++component)
+		{
+			if (strchr("xyzw", *component))
+				mIntegerAliases.erase(register_name + "." + string(1, *component));
+		}
+	}
+
+	string declareIntegerAlias(const char *target, bool unsigned_value)
+	{
+		string key;
+		int register_number;
+		char component;
+		if (!singleTempComponent(target, key, register_number, component))
+			return "";
+		string alias = "r" + to_string(register_number) + (unsigned_value ? "_uint_" : "_int_") + component;
+		if (mDeclaredIntegerAliases.insert(alias).second)
+		{
+			string declaration = "  " + string(unsigned_value ? "uint " : "int ") + alias + ";\n";
+			mOutput.insert(mOutput.end(), declaration.begin(), declaration.end());
+		}
+		mIntegerAliases[key] = alias;
+		return alias;
+	}
+
 	// DXBC bitwise instructions operate on the raw 32-bit register contents.
 	// The decompiler keeps temporary registers as float4 for compatibility with
 	// the rest of the generated shader, so numeric casts are not sufficient here:
@@ -3071,6 +3167,12 @@ public:
 	void bitcastToUInt(char *target)
 	{
 		char buffer[opcodeSize];
+		string alias = integerAliasForOperand(target);
+		if (!alias.empty())
+		{
+			strcpy_s(target, opcodeSize, alias.c_str());
+			return;
+		}
 		if (!strncmp(target, "uint", 4) ||
 			!strncmp(target, "asint(", 6) || !strncmp(target, "asuint(", 7))
 			return;
@@ -3084,6 +3186,12 @@ public:
 	void bitcastToInt(char *target)
 	{
 		char buffer[opcodeSize];
+		string alias = integerAliasForOperand(target);
+		if (!alias.empty())
+		{
+			strcpy_s(target, opcodeSize, alias.c_str());
+			return;
+		}
 		if (!strncmp(target, "int", 3) ||
 			!strncmp(target, "asint(", 6) || !strncmp(target, "asuint(", 7))
 			return;
@@ -4530,6 +4638,8 @@ public:
 	{
 		mOutputRegisterValues.clear();
 		mBooleanRegisters.clear();
+		mIntegerAliases.clear();
+		mDeclaredIntegerAliases.clear();
 		mCodeStartPos = mOutput.size();
 
 		char buffer[512];
@@ -5100,6 +5210,8 @@ public:
 			}//dx9
 			else
 			{
+				if (instr->ui32NumOperands && instr->asOperands[0].eType == OPERAND_TYPE_TEMP)
+					invalidateIntegerAliases(op1);
 				switch (instr->eOpcode)
 				{
 
@@ -5125,6 +5237,10 @@ public:
 						remapTarget(op1);
 						bool sourceIsBoolean = isBoolean(op2);
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
+						string movedIntegerAlias;
+						map<string, string>::iterator movedAlias = mIntegerAliases.find(op2);
+						if (movedAlias != mIntegerAliases.end())
+							movedIntegerAlias = movedAlias->second;
 						if (!instr->bSaturate)
 							sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(op2).c_str());
 						else
@@ -5139,6 +5255,14 @@ public:
 						removeBoolean(op1);
 						if (sourceIsBoolean)
 							addBoolean(op1);
+						if (!movedIntegerAlias.empty())
+						{
+							string destination;
+							int register_number;
+							char component;
+							if (singleTempComponent(op1, destination, register_number, component))
+								mIntegerAliases[destination] = movedIntegerAlias;
+						}
 						break;
 					}
 
@@ -6213,16 +6337,42 @@ public:
 					case OPCODE_FTOI:
 						remapTarget(op1);
 						applySwizzle(op1, op2);
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(castToInt(op2)).c_str());
-						appendOutput(buffer);
+						{
+							string alias = declareIntegerAlias(op1, false);
+							if (!alias.empty())
+							{
+								sprintf(buffer, "  %s = %s;\n", alias.c_str(), ci(castToInt(op2)).c_str());
+								appendOutput(buffer);
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), alias.c_str());
+								appendOutput(buffer);
+							}
+							else
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), ci(castToInt(op2)).c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
 					case OPCODE_FTOU:
 						remapTarget(op1);
 						applySwizzle(op1, op2);
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(castToUInt(op2)).c_str());
-						appendOutput(buffer);
+						{
+							string alias = declareIntegerAlias(op1, true);
+							if (!alias.empty())
+							{
+								sprintf(buffer, "  %s = %s;\n", alias.c_str(), ci(castToUInt(op2)).c_str());
+								appendOutput(buffer);
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), alias.c_str());
+								appendOutput(buffer);
+							}
+							else
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), ci(castToUInt(op2)).c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
