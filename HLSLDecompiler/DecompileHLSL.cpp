@@ -1952,9 +1952,12 @@ public:
 						break;
 					case OPCODE_LD_STRUCTURED:
 						// The index operand is an integer sink as well (t6[t8[x]]).
+						// Index operands are commonly select-one operands. Those do
+						// not reliably expose a component mask, so checking the mask
+						// here loses the t8[probeBit] -> probeIndex type edge.
+						// source_component() resolves select-one/swizzled operands.
 						for (int lane = 0; lane < 4; ++lane)
-							if (instruction.asOperands[1].ui32CompMask & (1u << lane))
-								mark_integer_use(instruction.asOperands[1], lane);
+							mark_integer_use(instruction.asOperands[1], lane);
 						break;
 					default:
 						break;
@@ -4259,7 +4262,10 @@ public:
 		ret += var->Name;
 
 		var_size = ShaderVarSize(var, &elem_size);
-		if (var->Elements) {
+		// Reflection reports a single-element field as Elements == 1, but
+		// its HLSL declaration is a scalar ("float val"), not "float val[1]".
+		// Indexing it as val[0] makes the regenerated shader invalid.
+		if (var->Elements > 1) {
 			// The index GetShaderVarFromOffset returns is crap, calculate it ourselves:
 			index = (offset - var->Offset) / elem_size;
 			ret += "[" + std::to_string(index) + "]";
@@ -5463,15 +5469,25 @@ public:
 						bool sourceIsBoolean = isBoolean(op2);
 						bool movedIntegerBitPattern = isIntegerBitPatternOperand(op2);
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
-						string movedIntegerAlias;
-						map<string, string>::iterator movedAlias = mIntegerAliases.find(op2);
-						if (movedAlias != mIntegerAliases.end())
-							movedIntegerAlias = movedAlias->second;
-						if (!instr->bSaturate)
-							sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(op2).c_str());
-						else
-							sprintf(buffer, "  %s = saturate(%s);\n", writeTarget(op1), ci(op2).c_str());
-						appendOutput(buffer);
+						string movedIntegerAlias = integerAliasForOperand(op2);
+						bool emittedIntegerMove = false;
+						if (!instr->bSaturate && !movedIntegerAlias.empty())
+						{
+							// A DXBC mov copies a value, not a variable identity. Keep
+							// tile index, probe masks, probe bit and probe index in
+							// separate HLSL live ranges rather than mapping both
+							// register components to one alias.
+							bool unsigned_value = movedIntegerAlias.find("_uint_") != string::npos;
+							emittedIntegerMove = emitIntegerAssignment(op1, movedIntegerAlias.c_str(), unsigned_value);
+						}
+						if (!emittedIntegerMove)
+						{
+							if (!instr->bSaturate)
+								sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(op2).c_str());
+							else
+								sprintf(buffer, "  %s = saturate(%s);\n", writeTarget(op1), ci(op2).c_str());
+							appendOutput(buffer);
+						}
 						if (op1[0] == 'o')
 						{
 							char *dotPos = strchr(op1, '.'); if (dotPos) *dotPos = 0;
@@ -5481,7 +5497,7 @@ public:
 						removeBoolean(op1);
 						if (sourceIsBoolean)
 							addBoolean(op1);
-						if (!movedIntegerAlias.empty())
+						if (!emittedIntegerMove && !movedIntegerAlias.empty())
 						{
 							string destination;
 							int register_number;
