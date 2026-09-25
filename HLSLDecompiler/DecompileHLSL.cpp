@@ -179,6 +179,7 @@ public:
 	set<string> mBooleanRegisters;
 	map<string, string> mIntegerAliases;
 	set<string> mDeclaredIntegerAliases;
+	set<string> mIntegerBitPatternComponents;
 
 	DecompilerSettings *G;
 
@@ -3149,8 +3150,42 @@ public:
 		for (const char *component = dot + 1; *component; ++component)
 		{
 			if (strchr("xyzw", *component))
+			{
 				mIntegerAliases.erase(register_name + "." + string(1, *component));
+				mIntegerBitPatternComponents.erase(register_name + "." + string(1, *component));
+			}
 		}
+	}
+
+	void markIntegerBitPatternComponents(const char *operand)
+	{
+		if (!operand || operand[0] != 'r')
+			return;
+		const char *dot = strchr(operand, '.');
+		string register_name = dot ? string(operand, dot - operand) : string(operand);
+		if (!dot)
+		{
+			for (const char *component = "xyzw"; *component; ++component)
+				mIntegerBitPatternComponents.insert(register_name + "." + string(1, *component));
+			return;
+		}
+		for (const char *component = dot + 1; *component; ++component)
+			if (strchr("xyzw", *component))
+				mIntegerBitPatternComponents.insert(register_name + "." + string(1, *component));
+	}
+
+	bool isIntegerBitPatternOperand(const char *operand) const
+	{
+		return mIntegerBitPatternComponents.find(operand) != mIntegerBitPatternComponents.end();
+	}
+
+	void markIntegerBitPatternLane(const char *target, int lane)
+	{
+		if (!target || target[0] != 'r' || lane < 0 || lane > 3)
+			return;
+		const char *dot = strchr(target, '.');
+		string register_name = dot ? string(target, dot - target) : string(target);
+		mIntegerBitPatternComponents.insert(register_name + "." + string(1, "xyzw"[lane]));
 	}
 
 	string declareIntegerAlias(const char *target, bool unsigned_value)
@@ -4171,6 +4206,8 @@ public:
 
 		applySwizzle(".x", idx);
 		applySwizzle(".x", off);
+		if (isIntegerBitPatternOperand(idx) || !integerAliasForOperand(idx).empty())
+			bitcastToUInt(idx);
 
 		*combined = false;
 
@@ -4235,7 +4272,14 @@ public:
 								ci(idx).c_str(),
 								var_txt.c_str());
 						if (IsStructuredBufferIntegerOffset(struct_type_i->second, byte_offset))
+						{
 							ret[component] = "asfloat(" + string(buffer) + ")";
+							if (dst0.eType == OPERAND_TYPE_TEMP)
+							{
+								string target = "r" + to_string(dst0.ui32RegisterNumber);
+								markIntegerBitPatternLane(target.c_str(), component);
+							}
+						}
 						else
 							ret[component] = buffer;
 					}
@@ -4655,6 +4699,7 @@ public:
 		mBooleanRegisters.clear();
 		mIntegerAliases.clear();
 		mDeclaredIntegerAliases.clear();
+		mIntegerBitPatternComponents.clear();
 		mCodeStartPos = mOutput.size();
 
 		char buffer[512];
@@ -5229,6 +5274,44 @@ public:
 					invalidateIntegerAliases(op1);
 				switch (instr->eOpcode)
 				{
+				case OPCODE_FTOI:
+				case OPCODE_FTOU:
+				case OPCODE_IMIN:
+				case OPCODE_IMAX:
+				case OPCODE_UMIN:
+				case OPCODE_UMAX:
+				case OPCODE_IADD:
+				case OPCODE_IMAD:
+				case OPCODE_UMAD:
+				case OPCODE_INEG:
+				case OPCODE_ISHL:
+				case OPCODE_ISHR:
+				case OPCODE_USHR:
+				case OPCODE_AND:
+				case OPCODE_OR:
+				case OPCODE_XOR:
+				case OPCODE_NOT:
+				case OPCODE_FIRSTBIT_HI:
+				case OPCODE_FIRSTBIT_LO:
+				case OPCODE_FIRSTBIT_SHI:
+				case OPCODE_COUNTBITS:
+				case OPCODE_UBFE:
+				case OPCODE_IBFE:
+				case OPCODE_BFI:
+				case OPCODE_BFREV:
+				case OPCODE_UDIV:
+					markIntegerBitPatternComponents(op1);
+					break;
+				case OPCODE_IMUL:
+				case OPCODE_UMUL:
+					invalidateIntegerAliases(op2);
+					markIntegerBitPatternComponents(op2);
+					break;
+				default:
+					break;
+				}
+				switch (instr->eOpcode)
+				{
 
 					case OPCODE_ITOF:
 						remapTarget(op1);
@@ -5251,6 +5334,7 @@ public:
 					{
 						remapTarget(op1);
 						bool sourceIsBoolean = isBoolean(op2);
+						bool movedIntegerBitPattern = isIntegerBitPatternOperand(op2);
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
 						string movedIntegerAlias;
 						map<string, string>::iterator movedAlias = mIntegerAliases.find(op2);
@@ -5278,6 +5362,8 @@ public:
 							if (singleTempComponent(op1, destination, register_number, component))
 								mIntegerAliases[destination] = movedIntegerAlias;
 						}
+						if (movedIntegerBitPattern)
+							markIntegerBitPatternComponents(op1);
 						break;
 					}
 
