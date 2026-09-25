@@ -20,6 +20,7 @@
 #include <map>
 #include <string>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <set>
 #include <algorithm>
@@ -3034,6 +3035,15 @@ public:
 		return value;
 	}
 
+	bool isIntegerLiteral(const char *value)
+	{
+		if (!value || !*value)
+			return false;
+		char *end = NULL;
+		strtol(value, &end, 0);
+		return end && *end == 0;
+	}
+
 	string integerMinMaxExpression(const char *destination, const char *source0, const char *source1,
 		bool unsignedValue, bool maximum)
 	{
@@ -3043,9 +3053,10 @@ public:
 
 		for (size_t i = 0; i < lanes.size(); ++i)
 		{
-			int lane = (int)lanes[i] - 'x';
-			if (lane < 0 || lane > 3)
+			const char *lane_position = strchr("xyzw", lanes[i]);
+			if (!lane_position)
 				continue;
+			int lane = (int)(lane_position - "xyzw");
 			if (!lhs.empty())
 			{
 				lhs += ", ";
@@ -3167,6 +3178,8 @@ public:
 	void bitcastToUInt(char *target)
 	{
 		char buffer[opcodeSize];
+		if (isIntegerLiteral(target))
+			return;
 		string alias = integerAliasForOperand(target);
 		if (!alias.empty())
 		{
@@ -3186,6 +3199,8 @@ public:
 	void bitcastToInt(char *target)
 	{
 		char buffer[opcodeSize];
+		if (isIntegerLiteral(target))
+			return;
 		string alias = integerAliasForOperand(target);
 		if (!alias.empty())
 		{
