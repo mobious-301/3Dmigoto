@@ -3026,9 +3026,9 @@ public:
 		strcpy_s(value, opcodeSize, source);
 		applySwizzle(left, value, true);
 		if (unsignedValue)
-			convertToUInt(value);
+			bitcastToUInt(value);
 		else
-			convertToInt(value);
+			bitcastToInt(value);
 		return value;
 	}
 
@@ -3071,7 +3071,23 @@ public:
 	void bitcastToUInt(char *target)
 	{
 		char buffer[opcodeSize];
+		if (!strncmp(target, "uint", 4) ||
+			!strncmp(target, "asint(", 6) || !strncmp(target, "asuint(", 7))
+			return;
 		_snprintf_s(buffer, opcodeSize, opcodeSize, "asuint(%s)", target);
+		strcpy_s(target, opcodeSize, buffer);
+	}
+
+	// Integer DXBC results are kept in the float-shaped temporary register file
+	// as their original 32-bit pattern.  Integer consumers must therefore use a
+	// reinterpret cast, not a numeric float-to-int conversion.
+	void bitcastToInt(char *target)
+	{
+		char buffer[opcodeSize];
+		if (!strncmp(target, "int", 3) ||
+			!strncmp(target, "asint(", 6) || !strncmp(target, "asuint(", 7))
+			return;
+		_snprintf_s(buffer, opcodeSize, opcodeSize, "asint(%s)", target);
 		strcpy_s(target, opcodeSize, buffer);
 	}
 
@@ -3996,6 +4012,32 @@ public:
 		return ret;
 	}
 
+	bool IsStructuredBufferIntegerOffset(const string &type_name, int byte_offset)
+	{
+		map<string, set<int> >::iterator integer_type = mStructuredBufferIntegerOffsets.find(type_name);
+		if (integer_type == mStructuredBufferIntegerOffsets.end())
+			return false;
+
+		map<string, vector<pair<int, int> > >::iterator ranges = mStructuredBufferFieldRanges.find(type_name);
+		if (ranges == mStructuredBufferFieldRanges.end())
+			return integer_type->second.find(byte_offset) != integer_type->second.end();
+
+		for (size_t i = 0; i < ranges->second.size(); ++i)
+		{
+			int field_offset = ranges->second[i].first;
+			int field_end = field_offset + ranges->second[i].second;
+			if (byte_offset < field_offset || byte_offset >= field_end)
+				continue;
+			for (set<int>::iterator offset = integer_type->second.begin(); offset != integer_type->second.end(); ++offset)
+			{
+				if (*offset >= field_offset && *offset < field_end)
+					return true;
+			}
+			return false;
+		}
+		return false;
+	}
+
 	bool translate_structured_var(Shader *shader, const char *c, size_t &pos, size_t &size, Instruction *instr,
 			std::string ret[4], bool *combined, char *idx, char *off, char *reg, Operand *texture, int swiz_offsets[4])
 	{
@@ -4069,7 +4111,10 @@ public:
 								bindInfo->Name.c_str(),
 								ci(idx).c_str(),
 								var_txt.c_str());
-						ret[component] = buffer;
+						if (IsStructuredBufferIntegerOffset(struct_type_i->second, byte_offset))
+							ret[component] = "asfloat(" + string(buffer) + ")";
+						else
+							ret[component] = buffer;
 					}
 					return true;
 				} else {
@@ -5061,14 +5106,16 @@ public:
 					case OPCODE_ITOF:
 						remapTarget(op1);
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str());
+						bitcastToInt(op2);
+						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
 					case OPCODE_UTOF:
 						remapTarget(op1);
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(convertToUInt(op2)).c_str());
+						bitcastToUInt(op2);
+						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5118,7 +5165,8 @@ public:
 					case OPCODE_INEG:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
-						sprintf(buffer, "  %s = -%s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str());
+						bitcastToInt(op2);
+						sprintf(buffer, "  %s = asfloat(-%s);\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5167,10 +5215,12 @@ public:
 						remapTarget(op2);
 						applySwizzle(op2, op3, true);
 						applySwizzle(op2, op4, true);
+						bitcastToInt(op3);
+						bitcastToInt(op4);
 						mMulOperand = strncmp(op3, "int", 3) ? op3 : op4;
-						sprintf(buffer, "  %s = %s * %s;\n", writeTarget(op2), ci(convertToInt(op3)).c_str(), ci(convertToInt(op4)).c_str());
+						sprintf(buffer, "  %s = asfloat(%s * %s);\n", writeTarget(op2), ci(op3).c_str(), ci(op4).c_str());
 						appendOutput(buffer);
-						removeBoolean(op1);
+						removeBoolean(op2);
 						break;
 
 					case OPCODE_DIV:
@@ -5215,8 +5265,8 @@ public:
 							applySwizzle(divSwiz, divOut, true);
 							applySwizzle(divSwiz, fixImm(op13, instr->asOperands[2]), true);
 							applySwizzle(divSwiz, fixImm(op14, instr->asOperands[3]), true);
-							convertToUInt(op13);
-							convertToUInt(op14);
+							bitcastToUInt(op13);
+							bitcastToUInt(op14);
 
 							sprintf(buffer, "  %s = %s / %s;\n", divOut, ci(op13).c_str(), ci(op14).c_str());
 							appendOutput(buffer);
@@ -5225,15 +5275,15 @@ public:
 						{
 							applySwizzle(remSwiz, fixImm(op3, instr->asOperands[2]), true);
 							applySwizzle(remSwiz, fixImm(op4, instr->asOperands[3]), true);
-							convertToUInt(op3);
-							convertToUInt(op4);
+							bitcastToUInt(op3);
+							bitcastToUInt(op4);
 
-							sprintf(buffer, "  %s = %s %% %s;\n", writeTarget(op2), ci(op3).c_str(), ci(op4).c_str());
+							sprintf(buffer, "  %s = asfloat(%s %% %s);\n", writeTarget(op2), ci(op3).c_str(), ci(op4).c_str());
 							appendOutput(buffer);
 						}
 						if (instr->asOperands[0].eType != OPERAND_TYPE_NULL)
 						{
-							sprintf(buffer, "  %s = %s;\n", writeTarget(op1), divOut);
+							sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), divOut);
 							appendOutput(buffer);
 						}
 						removeBoolean(op1);
@@ -5284,7 +5334,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = %s + %s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s + %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5337,7 +5389,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = %s >> %s;\n", writeTarget(op1), ci(convertToUInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s >> %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5346,7 +5400,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = %s << %s;\n", writeTarget(op1), ci(convertToUInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s << %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5357,7 +5413,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = %s >> %s;\n", writeTarget(op1), ci(convertToUInt(op2)).c_str(), ci(convertToUInt(op3)).c_str());
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s >> %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5366,7 +5424,8 @@ public:
 					case OPCODE_COUNTBITS:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
-						sprintf(buffer, "  %s = countbits(%s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str());
+						bitcastToUInt(op2);
+						sprintf(buffer, "  %s = asfloat(countbits(%s));\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5376,21 +5435,24 @@ public:
 					case OPCODE_FIRSTBIT_HI:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
-						sprintf(buffer, "  %s = firstbithigh(%s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str());
+						bitcastToUInt(op2);
+						sprintf(buffer, "  %s = asfloat(firstbithigh(%s));\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
 					case OPCODE_FIRSTBIT_LO:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
-						sprintf(buffer, "  %s = firstbitlow(%s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str());
+						bitcastToUInt(op2);
+						sprintf(buffer, "  %s = asfloat(firstbitlow(%s));\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
 					case OPCODE_FIRSTBIT_SHI:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
-						sprintf(buffer, "  %s = firstbithigh(%s);\n", writeTarget(op1), ci(convertToInt(op2)).c_str());
+						bitcastToInt(op2);
+						sprintf(buffer, "  %s = asfloat(firstbithigh(%s));\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5437,12 +5499,12 @@ public:
 							applySwizzle(op1, op2, true);
 							applySwizzle(op1, op3, true);
 							applySwizzle(op1, op4);
-							sprintf(buffer, "  %s = (%s == 0 ? 0 : ("
+							sprintf(buffer, "  %s = asfloat((%s == 0 ? 0 : ("
 										"%s + %s < 32 ? ("
 											"((int%s)%s << (32 - %s - %s)) >> (32 - %s)"
 										") : ("
 											"(int%s)%s >> %s"
-									")));\n",
+									"))));\n",
 									writeTarget(op1), ci(op2).c_str(),
 										ci(op2).c_str(), ci(op3).c_str(),
 											swizCount(op4).c_str(), ci(op4).c_str(), ci(op2).c_str(), ci(op3).c_str(), ci(op2).c_str(),
@@ -5456,7 +5518,8 @@ public:
 					case OPCODE_BFREV:
 						remapTarget(op1);
 						applySwizzle(op1, op2);
-						sprintf(buffer, "  %s = reversebits(%s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str());
+						bitcastToUInt(op2);
+						sprintf(buffer, "  %s = asfloat(reversebits(%s));\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5574,7 +5637,7 @@ public:
 						char *source0 = fixImm(op2, instr->asOperands[1]);
 						char *source1 = fixImm(op3, instr->asOperands[2]);
 						string expression = integerMinMaxExpression(op1, source0, source1, true, false);
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
+						sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5587,7 +5650,7 @@ public:
 						char *source0 = fixImm(op2, instr->asOperands[1]);
 						char *source1 = fixImm(op3, instr->asOperands[2]);
 						string expression = integerMinMaxExpression(op1, source0, source1, true, true);
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
+						sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5847,7 +5910,7 @@ public:
 						string expression = integerMinMaxExpression(op1, source0, source1, false, false);
 						if (instr->bSaturate)
 							expression = "saturate(" + expression + ")";
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
+						sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5860,7 +5923,7 @@ public:
 						string expression = integerMinMaxExpression(op1, source0, source1, false, true);
 						if (instr->bSaturate)
 							expression = "saturate(" + expression + ")";
-						sprintf(buffer, "  %s = %s;\n", writeTarget(op1), expression.c_str());
+						sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5891,7 +5954,10 @@ public:
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
 						applySwizzle(op1, op4, true);
-						sprintf(buffer, "  %s = mad(%s, %s, %s);\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str(), ci(convertToInt(op4)).c_str());
+						bitcastToInt(op2);
+						bitcastToInt(op3);
+						bitcastToInt(op4);
+						sprintf(buffer, "  %s = asfloat(mad(%s, %s, %s));\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str(), ci(op4).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -5900,7 +5966,10 @@ public:
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
 						applySwizzle(op1, op4, true);
-						sprintf(buffer, "  %s = mad(%s, %s, %s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str(), ci(convertToUInt(op3)).c_str(), ci(convertToUInt(op4)).c_str());
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						bitcastToUInt(op4);
+						sprintf(buffer, "  %s = asfloat(mad(%s, %s, %s));\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str(), ci(op4).c_str());
 						appendOutput(buffer);
 						removeBoolean(op1);
 						break;
@@ -6233,7 +6302,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = cmp(%s != %s);\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToInt(op3);
+						sprintf(buffer, "  %s = cmp(%s != %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						addBoolean(op1);
 						break;
@@ -6253,7 +6324,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = cmp(%s == %s);\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToInt(op3);
+						sprintf(buffer, "  %s = cmp(%s == %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						addBoolean(op1);
 						break;
@@ -6273,7 +6346,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = cmp(%s < %s);\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToInt(op3);
+						sprintf(buffer, "  %s = cmp(%s < %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						addBoolean(op1);
 						break;
@@ -6283,7 +6358,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = cmp(%s < %s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str(), ci(convertToUInt(op3)).c_str());
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = cmp(%s < %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						addBoolean(op1);
 						break;
@@ -6303,7 +6380,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = cmp(%s >= %s);\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToInt(op2);
+						bitcastToInt(op3);
+						sprintf(buffer, "  %s = cmp(%s >= %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						addBoolean(op1);
 						break;
@@ -6313,7 +6392,9 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						sprintf(buffer, "  %s = cmp(%s >= %s);\n", writeTarget(op1), ci(convertToUInt(op2)).c_str(), ci(convertToUInt(op3)).c_str());
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = cmp(%s >= %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
 						addBoolean(op1);
 						break;
@@ -6983,18 +7064,26 @@ public:
 							if (bindInfoPtr->eDimension == REFLECT_RESOURCE_DIMENSION_TEXTURE2D)
 							{
 								if (returnType == RESINFO_INSTRUCTION_RETURN_UINT)
-									sprintf(buffer, "  %s.GetDimensions(0, uiDest.x, uiDest.y, uiDest.z);\n", bindInfoPtr->Name.c_str());
+								{
+									sprintf(buffer, "  uiDest = 0; %s.GetDimensions(0, uiDest.x, uiDest.y, uiDest.w);\n", bindInfoPtr->Name.c_str());
+								}
 								else
-									sprintf(buffer, "  %s.GetDimensions(0, fDest.x, fDest.y, fDest.z);\n", bindInfoPtr->Name.c_str());
+								{
+									sprintf(buffer, "  fDest = 0; %s.GetDimensions(0, fDest.x, fDest.y, fDest.w);\n", bindInfoPtr->Name.c_str());
+								}
 								appendOutput(buffer);
 								unknownVariant = false;
 							}
 							else if (bindInfoPtr->eDimension == REFLECT_RESOURCE_DIMENSION_TEXTURE2DMS)
 							{
 								if (returnType == RESINFO_INSTRUCTION_RETURN_UINT)
-									sprintf(buffer, "  %s.GetDimensions(uiDest.x, uiDest.y, uiDest.z);\n", bindInfoPtr->Name.c_str());
+								{
+									sprintf(buffer, "  uiDest = 0; %s.GetDimensions(uiDest.x, uiDest.y, uiDest.z);\n", bindInfoPtr->Name.c_str());
+								}
 								else
-									sprintf(buffer, "  %s.GetDimensions(fDest.x, fDest.y, fDest.z);\n", bindInfoPtr->Name.c_str());
+								{
+									sprintf(buffer, "  fDest = 0; %s.GetDimensions(fDest.x, fDest.y, fDest.z);\n", bindInfoPtr->Name.c_str());
+								}
 								appendOutput(buffer);
 								unknownVariant = false;
 							}
