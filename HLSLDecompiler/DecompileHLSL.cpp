@@ -153,6 +153,9 @@ public:
 
 	map<string, string> mStructuredBufferTypes;
 	set<string> mStructuredBufferUsedNames;
+	map<string, string> mStructuredBufferDeclarations;
+	map<string, vector<pair<int, int> > > mStructuredBufferFieldRanges;
+	map<string, set<int> > mStructuredBufferIntegerOffsets;
 
 	//dx9
 	map<int, string> mUniformNames;
@@ -1768,12 +1771,268 @@ public:
 				} else {
 					// Add the stripped line to the HLSL output, unless blank:
 					NextLine(c, pos, size);
-					if (c[fpos] != '\n')
-						hlsl += string(c, spos, pos - spos);
+					if (c[fpos] != '\n') {
+						string field(c, spos, pos - spos);
+						const char *layout = strstr(field.c_str(), "Offset:");
+						int field_offset = 0;
+						int field_size = 0;
+						if (layout && sscanf_s(layout, "Offset: %d Size: %d", &field_offset, &field_size) == 2)
+							mStructuredBufferFieldRanges[type_name].push_back(make_pair(field_offset, field_size));
+						hlsl += field;
+					}
 				}
 			}
 			hlsl += "};\n";
+			mStructuredBufferDeclarations[type_name] = hlsl;
+		}
+	}
+
+	void WriteStructureDefinitions()
+	{
+		for (map<string, string>::iterator declaration = mStructuredBufferDeclarations.begin();
+			declaration != mStructuredBufferDeclarations.end(); ++declaration)
+		{
+			string hlsl = declaration->second;
+			map<string, vector<pair<int, int> > >::iterator ranges = mStructuredBufferFieldRanges.find(declaration->first);
+			set<int> *integer_offsets = NULL;
+			map<string, set<int> >::iterator integer_type = mStructuredBufferIntegerOffsets.find(declaration->first);
+			if (integer_type != mStructuredBufferIntegerOffsets.end())
+				integer_offsets = &integer_type->second;
+
+			if (ranges != mStructuredBufferFieldRanges.end() && integer_offsets && !integer_offsets->empty())
+			{
+				string rewritten;
+				size_t line_start = 0;
+				size_t range_index = 0;
+				while (line_start < hlsl.size())
+				{
+					size_t line_end = hlsl.find('\n', line_start);
+					if (line_end == string::npos)
+						line_end = hlsl.size();
+					string line = hlsl.substr(line_start, line_end - line_start);
+					bool integer_field = false;
+					if (line.find("Offset:") != string::npos && range_index < ranges->second.size())
+					{
+						int field_offset = ranges->second[range_index].first;
+						int field_size = ranges->second[range_index].second;
+						for (set<int>::iterator offset = integer_offsets->begin(); offset != integer_offsets->end(); ++offset)
+						{
+							if (*offset >= field_offset && *offset < field_offset + field_size)
+							{
+								integer_field = true;
+								break;
+							}
+						}
+						++range_index;
+					}
+
+					if (integer_field)
+					{
+						size_t type = line.find("float");
+						if (type != string::npos)
+							line.replace(type, 5, "uint");
+					}
+					rewritten += line;
+					if (line_end < hlsl.size())
+						rewritten += '\n';
+					line_start = line_end < hlsl.size() ? line_end + 1 : hlsl.size();
+				}
+				hlsl.swap(rewritten);
+			}
 			mOutput.insert(mOutput.end(), hlsl.begin(), hlsl.end());
+		}
+	}
+
+	void InferStructuredBufferIntegerTypes(Shader *shader)
+	{
+		struct StructuredOrigin
+		{
+			string type_name;
+			int byte_offset;
+		};
+
+		map<pair<uint32_t, int>, StructuredOrigin> origins;
+
+		for (uint32_t phase = 0; phase < NUM_PHASES; ++phase)
+		{
+			for (size_t instance = 0; instance < shader->asPhase[phase].ppsInst.size(); ++instance)
+			{
+				vector<Instruction> &instructions = shader->asPhase[phase].ppsInst[instance];
+				for (size_t instruction_index = 0; instruction_index < instructions.size(); ++instruction_index)
+				{
+					Instruction &instruction = instructions[instruction_index];
+
+					auto source_component = [](const Operand &operand, int lane) -> int {
+						if (operand.eSelMode == OPERAND_4_COMPONENT_SELECT_1_MODE)
+							return (int)operand.aui32Swizzle[0];
+						if (operand.eSelMode == OPERAND_4_COMPONENT_SWIZZLE_MODE)
+							return (int)operand.aui32Swizzle[lane];
+						return lane;
+					};
+
+					auto source_origin = [&](const Operand &operand, int lane, StructuredOrigin &origin) -> bool {
+						if (operand.eType != OPERAND_TYPE_TEMP)
+							return false;
+						int component = source_component(operand, lane);
+						if (component < 0 || component > 3)
+							return false;
+						map<pair<uint32_t, int>, StructuredOrigin>::iterator found =
+							origins.find(make_pair(operand.ui32RegisterNumber, component));
+						if (found == origins.end())
+							return false;
+						origin = found->second;
+						return true;
+					};
+
+					auto mark_integer_use = [&](const Operand &operand, int lane) {
+						StructuredOrigin origin;
+						if (source_origin(operand, lane, origin))
+							mStructuredBufferIntegerOffsets[origin.type_name].insert(origin.byte_offset);
+					};
+
+					auto clear_destination = [&](const Operand &operand) {
+						if (operand.eType != OPERAND_TYPE_TEMP)
+							return;
+						for (int lane = 0; lane < 4; ++lane)
+						{
+							if (operand.ui32CompMask & (1u << lane))
+								origins.erase(make_pair(operand.ui32RegisterNumber, lane));
+						}
+					};
+
+					// These instructions consume a raw integer value.  This is the
+					// reverse edge that lets a later use refine the type of an earlier
+					// structured load.
+					switch (instruction.eOpcode)
+					{
+					case OPCODE_FIRSTBIT_HI:
+					case OPCODE_FIRSTBIT_LO:
+					case OPCODE_FIRSTBIT_SHI:
+					case OPCODE_COUNTBITS:
+					case OPCODE_NOT:
+						mark_integer_use(instruction.asOperands[1], 0);
+						break;
+					case OPCODE_AND:
+					case OPCODE_OR:
+					case OPCODE_XOR:
+			case OPCODE_ISHL:
+			case OPCODE_ISHR:
+			case OPCODE_USHR:
+			case OPCODE_IADD:
+			case OPCODE_IMAD:
+			case OPCODE_IMUL:
+			case OPCODE_INEG:
+			case OPCODE_IEQ:
+					case OPCODE_IGE:
+					case OPCODE_ILT:
+					case OPCODE_INE:
+					case OPCODE_ULT:
+					case OPCODE_UGE:
+					case OPCODE_IMIN:
+					case OPCODE_IMAX:
+					case OPCODE_UMIN:
+			case OPCODE_UMAX:
+			case OPCODE_UMUL:
+			case OPCODE_UMAD:
+			case OPCODE_UDIV:
+			case OPCODE_UBFE:
+			case OPCODE_IBFE:
+			case OPCODE_BFI:
+			case OPCODE_BFREV:
+						for (uint32_t operand_index = 1; operand_index < instruction.ui32NumOperands; ++operand_index)
+							for (int lane = 0; lane < 4; ++lane)
+								if (instruction.asOperands[operand_index].ui32CompMask & (1u << lane))
+									mark_integer_use(instruction.asOperands[operand_index], lane);
+						break;
+					case OPCODE_LD_STRUCTURED:
+						// The index operand is an integer sink as well (t6[t8[x]]).
+						for (int lane = 0; lane < 4; ++lane)
+							if (instruction.asOperands[1].ui32CompMask & (1u << lane))
+								mark_integer_use(instruction.asOperands[1], lane);
+						break;
+					default:
+						break;
+					}
+
+					if (instruction.eOpcode == OPCODE_MOV && instruction.ui32NumOperands >= 2 &&
+						instruction.asOperands[0].eType == OPERAND_TYPE_TEMP)
+					{
+						map<pair<uint32_t, int>, StructuredOrigin> moved;
+						for (int lane = 0; lane < 4; ++lane)
+						{
+							if (!(instruction.asOperands[0].ui32CompMask & (1u << lane)))
+								continue;
+							StructuredOrigin origin;
+							if (source_origin(instruction.asOperands[1], lane, origin))
+								moved[make_pair(instruction.asOperands[0].ui32RegisterNumber, lane)] = origin;
+						}
+						clear_destination(instruction.asOperands[0]);
+						origins.insert(moved.begin(), moved.end());
+						continue;
+					}
+
+					if (instruction.eOpcode == OPCODE_LD_STRUCTURED && instruction.ui32NumOperands >= 4)
+					{
+						clear_destination(instruction.asOperands[0]);
+						string type_name;
+						Operand &resource = instruction.asOperands[3];
+						ResourceGroup group = resource.eType == OPERAND_TYPE_UNORDERED_ACCESS_VIEW ? RGROUP_UAV : RGROUP_TEXTURE;
+						ResourceBinding *bind_info = NULL;
+						if (GetResourceFromBindingPoint(group, resource.ui32RegisterNumber, shader->sInfo, &bind_info))
+						{
+							map<string, string>::iterator type = mStructuredBufferTypes.find(bind_info->Name);
+							if (type != mStructuredBufferTypes.end())
+								type_name = type->second;
+						}
+						if (type_name.empty())
+						{
+							string resource_name = (group == RGROUP_UAV ? "u" : "t") + to_string(resource.ui32RegisterNumber);
+							map<string, string>::iterator type = mStructuredBufferTypes.find(resource_name);
+							if (type != mStructuredBufferTypes.end())
+								type_name = type->second;
+						}
+
+						if (!type_name.empty() && instruction.asOperands[2].eType == OPERAND_TYPE_IMMEDIATE32)
+						{
+							int base_offset = (int)instruction.asOperands[2].afImmediates[0];
+							for (int lane = 0; lane < 4; ++lane)
+							{
+								if (!(instruction.asOperands[0].ui32CompMask & (1u << lane)))
+									continue;
+								int source_lane = (int)resource.aui32Swizzle[lane];
+								if (source_lane < 0 || source_lane > 3)
+									continue;
+								StructuredOrigin origin = { type_name, base_offset + source_lane * 4 };
+								origins[make_pair(instruction.asOperands[0].ui32RegisterNumber, lane)] = origin;
+							}
+						}
+						continue;
+					}
+
+					// Any other instruction writing a temporary kills the old load
+					// origin.  Source-only/control-flow instructions have no temp
+					// destination and are naturally ignored here.
+					if (instruction.ui32NumOperands && instruction.asOperands[0].eType == OPERAND_TYPE_TEMP)
+					{
+						switch (instruction.eOpcode)
+						{
+						case OPCODE_IF:
+						case OPCODE_LOOP:
+						case OPCODE_SWITCH:
+						case OPCODE_CASE:
+						case OPCODE_BREAKC:
+						case OPCODE_CONTINUEC:
+						case OPCODE_RETC:
+						case OPCODE_CALL:
+						case OPCODE_CALLC:
+							break;
+						default:
+							clear_destination(instruction.asOperands[0]);
+							break;
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -7042,6 +7301,8 @@ const string DecompileBinaryHLSL(ParseParameters &params, bool &patched, std::st
 		{
 			d.ParseStructureDefinitions(shader, params.decompiled, params.decompiledSize);
 			d.ReadResourceBindings(params.decompiled, params.decompiledSize);
+			d.InferStructuredBufferIntegerTypes(shader);
+			d.WriteStructureDefinitions();
 		}
 
 		d.ParseBufferDefinitions(shader, params.decompiled, params.decompiledSize);
