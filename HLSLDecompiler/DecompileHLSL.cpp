@@ -178,8 +178,10 @@ public:
 	vector<pair<string, string> > mRemappedInputRegisters;
 	set<string> mBooleanRegisters;
 	map<string, string> mIntegerAliases;
+	map<string, string> mIntegerReadAliases;
 	set<string> mDeclaredIntegerAliases;
 	set<string> mIntegerBitPatternComponents;
+	set<string> mIntegerReadBitPatternComponents;
 
 	DecompilerSettings *G;
 
@@ -3101,6 +3103,9 @@ public:
 		map<string, string>::iterator exact = mIntegerAliases.find(value);
 		if (exact != mIntegerAliases.end())
 			return (negative ? "-" : "") + exact->second;
+		exact = mIntegerReadAliases.find(value);
+		if (exact != mIntegerReadAliases.end())
+			return (negative ? "-" : "") + exact->second;
 
 		size_t dot = value.find('.');
 		if (dot == string::npos || value[0] != 'r')
@@ -3118,7 +3123,11 @@ public:
 			string key = register_name + "." + components.substr(i, 1);
 			map<string, string>::iterator alias = mIntegerAliases.find(key);
 			if (alias == mIntegerAliases.end())
-				return "";
+			{
+				alias = mIntegerReadAliases.find(key);
+				if (alias == mIntegerReadAliases.end())
+					return "";
+			}
 			if (!result.empty())
 				result += ", ";
 			result += alias->second;
@@ -3128,6 +3137,83 @@ public:
 		if (negative)
 			result = "-" + result;
 		return result;
+	}
+
+	void preserveIntegerReadOperand(const char *operand)
+	{
+		if (!operand)
+			return;
+
+		const char *value = operand[0] == '-' ? operand + 1 : operand;
+		if (value[0] != 'r')
+			return;
+
+		const char *dot = strchr(value, '.');
+		string register_name = dot ? string(value, dot - value) : string(value);
+		string components = dot ? dot + 1 : "xyzw";
+		for (size_t i = 0; i < components.size(); ++i)
+		{
+			if (!strchr("xyzw", components[i]))
+				continue;
+			string key = register_name + "." + components.substr(i, 1);
+			map<string, string>::iterator alias = mIntegerAliases.find(key);
+			if (alias != mIntegerAliases.end())
+				mIntegerReadAliases[key] = alias->second;
+			if (mIntegerBitPatternComponents.find(key) != mIntegerBitPatternComponents.end())
+				mIntegerReadBitPatternComponents.insert(key);
+		}
+	}
+
+	// Texture Load coordinates are integer values.  DXBC temporary registers
+	// still carry the integer bit pattern as floats, so an implicit HLSL float
+	// to int conversion changes the coordinate instead of preserving it.
+	void integerLoadCoordinate(char *target)
+	{
+		if (!target || (target[0] != 'r' && !(target[0] == '-' && target[1] == 'r')))
+			return;
+
+		const char *register_start = target[0] == '-' ? target + 1 : target;
+		const char *dot = strchr(register_start, '.');
+		if (!dot || !dot[1] || dot[1] == '0')
+			return;
+
+		string register_name(register_start, dot - register_start);
+		string components = dot + 1;
+		if (components.empty() || components.size() > 4)
+			return;
+
+		string values;
+		for (size_t i = 0; i < components.size(); ++i)
+		{
+			char component = components[i];
+			if (!strchr("xyzw", component))
+				return;
+
+			string key = register_name + "." + component;
+			string value;
+			map<string, string>::iterator alias = mIntegerAliases.find(key);
+			if (alias != mIntegerAliases.end())
+				value = alias->second;
+			else if ((alias = mIntegerReadAliases.find(key)) != mIntegerReadAliases.end())
+				value = alias->second;
+			else if (mIntegerBitPatternComponents.find(key) != mIntegerBitPatternComponents.end() ||
+				mIntegerReadBitPatternComponents.find(key) != mIntegerReadBitPatternComponents.end())
+				value = "asint(" + key + ")";
+			else
+				// A temporary used as a DXBC Load coordinate is a typeless
+				// register carrying the integer bit pattern, even when the
+				// destination overlaps one of the coordinate components.
+				value = "asint(" + key + ")";
+
+			if (!values.empty())
+				values += ", ";
+			values += value;
+		}
+
+		string result = components.size() == 1
+			? values
+			: "int" + to_string(components.size()) + "(" + values + ")";
+		strcpy_s(target, opcodeSize, result.c_str());
 	}
 
 	void invalidateIntegerAliases(const char *operand)
@@ -3176,7 +3262,8 @@ public:
 
 	bool isIntegerBitPatternOperand(const char *operand) const
 	{
-		return mIntegerBitPatternComponents.find(operand) != mIntegerBitPatternComponents.end();
+		return mIntegerBitPatternComponents.find(operand) != mIntegerBitPatternComponents.end() ||
+			mIntegerReadBitPatternComponents.find(operand) != mIntegerReadBitPatternComponents.end();
 	}
 
 	void markIntegerBitPatternLane(const char *target, int lane)
@@ -4290,7 +4377,8 @@ public:
 								var_txt.c_str());
 						if (IsStructuredBufferIntegerOffset(struct_type_i->second, byte_offset))
 						{
-							ret[component] = "asfloat(" + string(buffer) + ")";
+							string raw_value = buffer;
+							ret[component] = "asfloat(" + raw_value + ")";
 							if (dst0.eType == OPERAND_TYPE_TEMP)
 							{
 								string target = "r" + to_string(dst0.ui32RegisterNumber);
@@ -4299,7 +4387,7 @@ public:
 								string alias = declareIntegerAlias(target.c_str(), true);
 								if (!alias.empty())
 								{
-									sprintf(buffer, "  %s = asuint(%s);\n", alias.c_str(), ret[component].substr(8, ret[component].size() - 9).c_str());
+									sprintf(buffer, "  %s = asuint(%s);\n", alias.c_str(), raw_value.c_str());
 									appendOutput(buffer);
 									ret[component] = "asfloat(" + alias + ")";
 								}
@@ -4724,8 +4812,10 @@ public:
 		mOutputRegisterValues.clear();
 		mBooleanRegisters.clear();
 		mIntegerAliases.clear();
+		mIntegerReadAliases.clear();
 		mDeclaredIntegerAliases.clear();
 		mIntegerBitPatternComponents.clear();
+		mIntegerReadBitPatternComponents.clear();
 		mCodeStartPos = mOutput.size();
 
 		char buffer[512];
@@ -5296,6 +5386,17 @@ public:
 			}//dx9
 			else
 			{
+				// Capture the integer meaning of source components before the
+				// destination invalidation below. DXBC permits read/write
+				// overlap, e.g. ld_structured r9.z, r9.z, ..., t8.
+				// The old value must remain available while translating the
+				// source operand, but must not become a live alias afterwards.
+				mIntegerReadAliases.clear();
+				mIntegerReadBitPatternComponents.clear();
+				char *read_operands[] = { op2, op3, op4, op5, op6, op7, op8, op9, op10, op11, op12, op13, op14, op15 };
+				for (uint32_t read_index = 1; read_index < instr->ui32NumOperands && read_index <= 14; ++read_index)
+					preserveIntegerReadOperand(read_operands[read_index - 1]);
+
 				if (instr->ui32NumOperands && instr->asOperands[0].eType == OPERAND_TYPE_TEMP)
 					invalidateIntegerAliases(op1);
 				switch (instr->eOpcode)
@@ -7224,6 +7325,7 @@ public:
 						int textureId;
 						sscanf_s(op3, "t%d.", &textureId);
 						truncateTextureLoadPos(op2, mTextureType[textureId].c_str());
+						integerLoadCoordinate(op2);
 						truncateTextureSwiz(op1, mTextureType[textureId].c_str());
 						truncateTextureSwiz(op3, mTextureType[textureId].c_str());
 						if (!instr->bAddressOffset)
@@ -7247,6 +7349,7 @@ public:
 						int textureId;
 						sscanf_s(op3, "t%d.", &textureId);
 						truncateTextureLoadPos(op2, mTextureType[textureId].c_str());
+						integerLoadCoordinate(op2);
 						truncateTextureSwiz(op1, mTextureType[textureId].c_str());
 						truncateTextureSwiz(op3, mTextureType[textureId].c_str());
 						if (!instr->bAddressOffset)
