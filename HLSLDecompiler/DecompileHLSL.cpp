@@ -3199,10 +3199,27 @@ public:
 		if (mDeclaredIntegerAliases.insert(alias).second)
 		{
 			string declaration = "  " + string(unsigned_value ? "uint " : "int ") + alias + ";\n";
-			mOutput.insert(mOutput.end(), declaration.begin(), declaration.end());
+			mOutput.insert(mOutput.begin() + mCodeStartPos, declaration.begin(), declaration.end());
+			mCodeStartPos += declaration.size();
 		}
 		mIntegerAliases[key] = alias;
 		return alias;
+	}
+
+	bool emitIntegerAssignment(const char *target, const char *expression, bool unsigned_value)
+	{
+		string alias = declareIntegerAlias(target, unsigned_value);
+		if (alias.empty())
+			return false;
+
+		char buffer[opcodeSize * 2];
+		char target_copy[opcodeSize];
+		strcpy_s(target_copy, opcodeSize, target);
+		sprintf(buffer, "  %s = %s;\n", alias.c_str(), expression);
+		appendOutput(buffer);
+		sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(target_copy), alias.c_str());
+		appendOutput(buffer);
+		return true;
 	}
 
 	// DXBC bitwise instructions operate on the raw 32-bit register contents.
@@ -4277,6 +4294,15 @@ public:
 							if (dst0.eType == OPERAND_TYPE_TEMP)
 							{
 								string target = "r" + to_string(dst0.ui32RegisterNumber);
+								target += ".";
+								target += "xyzw"[component];
+								string alias = declareIntegerAlias(target.c_str(), true);
+								if (!alias.empty())
+								{
+									sprintf(buffer, "  %s = asuint(%s);\n", alias.c_str(), ret[component].substr(8, ret[component].size() - 9).c_str());
+									appendOutput(buffer);
+									ret[component] = "asfloat(" + alias + ")";
+								}
 								markIntegerBitPatternLane(target.c_str(), component);
 							}
 						}
@@ -5382,8 +5408,14 @@ public:
 						applySwizzle(op1, op2);
 						removeBoolean(op1);
 						bitcastToUInt(op2);
-						sprintf(buffer, "  %s = asfloat(~%s);\n", writeTarget(op1), ci(op2).c_str());
-						appendOutput(buffer);
+						{
+							string expression = "~" + ci(op2);
+							if (!emitIntegerAssignment(op1, expression.c_str(), true))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						addBoolean(op1);
 						break;
 
@@ -5443,8 +5475,14 @@ public:
 						bitcastToInt(op3);
 						bitcastToInt(op4);
 						mMulOperand = strncmp(op3, "int", 3) ? op3 : op4;
-						sprintf(buffer, "  %s = asfloat(%s * %s);\n", writeTarget(op2), ci(op3).c_str(), ci(op4).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op3) + " * " + ci(op4);
+							if (!emitIntegerAssignment(op2, expression.c_str(), false))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op2), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op2);
 						break;
 
@@ -5561,8 +5599,14 @@ public:
 						applySwizzle(op1, op3, true);
 						bitcastToInt(op2);
 						bitcastToInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s + %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " + " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), false))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
@@ -5576,8 +5620,14 @@ public:
 						applySwizzle(op1, op3, true);
 						bitcastToUInt(op2);
 						bitcastToUInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s & %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " & " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), true))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						addBoolean(op1);
 						break;
 
@@ -5588,8 +5638,14 @@ public:
 						applySwizzle(op1, op3);
 						bitcastToUInt(op2);
 						bitcastToUInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s | %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " | " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), true))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						addBoolean(op1);
 						break;
 
@@ -5600,8 +5656,14 @@ public:
 						applySwizzle(op1, op3);
 						bitcastToUInt(op2);
 						bitcastToUInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s ^ %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " ^ " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), true))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						addBoolean(op1);
 						break;
 
@@ -5616,8 +5678,14 @@ public:
 						applySwizzle(op1, op3, true);
 						bitcastToInt(op2);
 						bitcastToUInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s >> %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " >> " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), false))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
@@ -5627,8 +5695,14 @@ public:
 						applySwizzle(op1, op3, true);
 						bitcastToInt(op2);
 						bitcastToUInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s << %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " << " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), false))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
@@ -5640,8 +5714,14 @@ public:
 						applySwizzle(op1, op3, true);
 						bitcastToUInt(op2);
 						bitcastToUInt(op3);
-						sprintf(buffer, "  %s = asfloat(%s >> %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
-						appendOutput(buffer);
+						{
+							string expression = ci(op2) + " >> " + ci(op3);
+							if (!emitIntegerAssignment(op1, expression.c_str(), true))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
@@ -5650,8 +5730,14 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						bitcastToUInt(op2);
-						sprintf(buffer, "  %s = asfloat(countbits(%s));\n", writeTarget(op1), ci(op2).c_str());
-						appendOutput(buffer);
+						{
+							string expression = "countbits(" + ci(op2) + ")";
+							if (!emitIntegerAssignment(op1, expression.c_str(), true))
+							{
+								sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+								appendOutput(buffer);
+							}
+						}
 						removeBoolean(op1);
 						break;
 
@@ -5661,24 +5747,42 @@ public:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						bitcastToUInt(op2);
-						sprintf(buffer, "  %s = asfloat(firstbithigh(%s));\n", writeTarget(op1), ci(op2).c_str());
-						appendOutput(buffer);
+					{
+						string expression = "firstbithigh(" + ci(op2) + ")";
+						if (!emitIntegerAssignment(op1, expression.c_str(), true))
+						{
+							sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+							appendOutput(buffer);
+						}
+					}
 						removeBoolean(op1);
 						break;
 					case OPCODE_FIRSTBIT_LO:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						bitcastToUInt(op2);
-						sprintf(buffer, "  %s = asfloat(firstbitlow(%s));\n", writeTarget(op1), ci(op2).c_str());
-						appendOutput(buffer);
+					{
+						string expression = "firstbitlow(" + ci(op2) + ")";
+						if (!emitIntegerAssignment(op1, expression.c_str(), true))
+						{
+							sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+							appendOutput(buffer);
+						}
+					}
 						removeBoolean(op1);
 						break;
 					case OPCODE_FIRSTBIT_SHI:
 						remapTarget(op1);
 						applySwizzle(op1, op2, true);
 						bitcastToInt(op2);
-						sprintf(buffer, "  %s = asfloat(firstbithigh(%s));\n", writeTarget(op1), ci(op2).c_str());
-						appendOutput(buffer);
+					{
+						string expression = "firstbithigh(" + ci(op2) + ")";
+						if (!emitIntegerAssignment(op1, expression.c_str(), false))
+						{
+							sprintf(buffer, "  %s = asfloat(%s);\n", writeTarget(op1), expression.c_str());
+							appendOutput(buffer);
+						}
+					}
 						removeBoolean(op1);
 						break;
 
