@@ -2754,6 +2754,18 @@ public:
 		return _convertToUInt(target, false);
 	}
 
+	// DXBC bitwise instructions operate on the raw 32-bit register contents.
+	// The decompiler keeps temporary registers as float4 for compatibility with
+	// the rest of the generated shader, so numeric casts are not sufficient here:
+	// a comparison mask such as 0xffffffff must remain the NaN bit pattern when
+	// it is stored in a float register.
+	void bitcastToUInt(char *target)
+	{
+		char buffer[opcodeSize];
+		_snprintf_s(buffer, opcodeSize, opcodeSize, "asuint(%s)", target);
+		strcpy_s(target, opcodeSize, buffer);
+	}
+
 	// The boolean check routines had the problem that they only looked for the actual register
 	// name, like r1, instead of including the component, like r1.x.  This fails in some cases
 	// because another component can legally be used in between, which would not clear the 
@@ -2769,10 +2781,10 @@ public:
 	// Well, another example is a n "and r0.xyzw, r0.yyyy, r2.xyzw" where r0.y is set early. 
 	// This requires at least single component entries in the mBooleanRegisters.
 
-	// 12-5-15: New change to all users of addBoolean, is that they will call a small helper
-	//  routine to do 'cmp', in order to return -1 or 0, instead of the HLSL 1 or 0.  This
-	//  is intended to fix the problems we see where the assembly is using the -1 numerically
-	//  and not as a boolean.  The helper is now just a macro "#define cmp -" to negate.
+	// Comparison and bitwise instructions use this set to remember components
+	// whose float-shaped storage contains a DXBC all-bits mask.  It is used by
+	// control-flow and movc so those consumers test the mask as uint bits rather
+	// than relying on floating-point NaN behavior.
 
 	void addBoolean(char *arg)
 	{
@@ -2835,6 +2847,15 @@ public:
 		{
 			mBooleanRegisters.erase(reg + '.' + op[i]);
 		}
+	}
+
+	string conditionExpression(char *arg, bool testZero)
+	{
+		bool isMask = isBoolean(arg);
+		string value = ci(arg);
+		if (isMask)
+			value = "asuint(" + value + ")";
+		return "(" + value + (testZero ? " == " : " != ") + (isMask ? "0u" : "0") + ")";
 	}
 
 
@@ -4744,7 +4765,9 @@ public:
 						break;
 
 					case OPCODE_MOV:
+					{
 						remapTarget(op1);
+						bool sourceIsBoolean = isBoolean(op2);
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
 						if (!instr->bSaturate)
 							sprintf(buffer, "  %s = %s;\n", writeTarget(op1), ci(op2).c_str());
@@ -4758,7 +4781,10 @@ public:
 								mOutputRegisterValues[op1] = op2;
 						}
 						removeBoolean(op1);
+						if (sourceIsBoolean)
+							addBoolean(op1);
 						break;
+					}
 
 					case OPCODE_RCP:
 						remapTarget(op1);
@@ -4773,8 +4799,11 @@ public:
 					case OPCODE_NOT:
 						remapTarget(op1);
 						applySwizzle(op1, op2);
-						sprintf(buffer, "  %s = ~%s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str());
+						removeBoolean(op1);
+						bitcastToUInt(op2);
+						sprintf(buffer, "  %s = asfloat(~%s);\n", writeTarget(op1), ci(op2).c_str());
 						appendOutput(buffer);
+						addBoolean(op1);
 						break;
 
 					case OPCODE_INEG:
@@ -4951,54 +4980,43 @@ public:
 						removeBoolean(op1);
 						break;
 
-						// AND opcodes were generating bad code, as the hex constants were being converted badly.
-						// The most common case was 0x3f800000 being converted directly to integer decimal of 1065353216, instead
-						// of the most likely answer of floating point 1.0f.
-						// This also happened for conversion of Pi.
-						// There are bitmasks used for AND, and those need to stay as Hex constants.
-						// But anything used after IF statements/booleans, needs to be converted as float.
-						// Rather than modify applySwizzle for this single opcode, it makes more sense to convert them here,
-						// if they are to be used in boolean operations.  We make a copy of the incoming operands, so that we
-						// can applySwizzle in order to be able to look up isBoolean properly.  Can be r3.xxxy, and becomes r3.xy.
-						// That applySwizzle damages constants though, so if we are boolean, we'll use the original l() value.
+					// Bitwise instructions operate on the register bit pattern, not on
+					// the numeric float value.  In particular, comparison results are
+					// 0xffffffff/0 and must not be converted to 1.0/-1.0.
 					case OPCODE_AND:
 						remapTarget(op1);
-						strcpy(op12, op2);
-						strcpy(op13, op3);
+						removeBoolean(op1);
 						applySwizzle(op1, op2, true);
 						applySwizzle(op1, op3, true);
-						if (isBoolean(op2) || isBoolean(op3))
-						{
-							convertHexToFloat(op12);
-							convertHexToFloat(op13);
-							applySwizzle(op1, op12);
-							applySwizzle(op1, op13);
-							char *cmp = isBoolean(op2) ? op12 : op13;
-							char *arg = isBoolean(op2) ? op13 : op12;
-							sprintf(buffer, "  %s = %s ? %s : 0;\n", writeTarget(op1), ci(cmp).c_str(), ci(arg).c_str());
-							appendOutput(buffer);
-						}
-						else
-						{
-							sprintf(buffer, "  %s = %s & %s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
-							appendOutput(buffer);
-						}
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s & %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
+						appendOutput(buffer);
+						addBoolean(op1);
 						break;
 
 					case OPCODE_OR:
 						remapTarget(op1);
+						removeBoolean(op1);
 						applySwizzle(op1, op2);
 						applySwizzle(op1, op3);
-						sprintf(buffer, "  %s = %s | %s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s | %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
+						addBoolean(op1);
 						break;
 
 					case OPCODE_XOR:
 						remapTarget(op1);
+						removeBoolean(op1);
 						applySwizzle(op1, op2);
 						applySwizzle(op1, op3);
-						sprintf(buffer, "  %s = %s ^ %s;\n", writeTarget(op1), ci(convertToInt(op2)).c_str(), ci(convertToInt(op3)).c_str());
+						bitcastToUInt(op2);
+						bitcastToUInt(op3);
+						sprintf(buffer, "  %s = asfloat(%s ^ %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str());
 						appendOutput(buffer);
+						addBoolean(op1);
 						break;
 
 						// Curiously enough, the documentation for ISHR and ISHL is wrong, and documents the parameters backwards.
@@ -5853,10 +5871,11 @@ public:
 						applySwizzle(op1, fixImm(op2, instr->asOperands[1]));
 						applySwizzle(op1, fixImm(op3, instr->asOperands[2]));
 						applySwizzle(op1, fixImm(op4, instr->asOperands[3]));
+						string condition = isBoolean(op2) ? conditionExpression(op2, false) : ci(op2);
 						if (!instr->bSaturate)
-							sprintf(buffer, "  %s = %s ? %s : %s;\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str(), ci(op4).c_str());
+							sprintf(buffer, "  %s = %s ? %s : %s;\n", writeTarget(op1), condition.c_str(), ci(op3).c_str(), ci(op4).c_str());
 						else
-							sprintf(buffer, "  %s = saturate(%s ? %s : %s);\n", writeTarget(op1), ci(op2).c_str(), ci(op3).c_str(), ci(op4).c_str());
+							sprintf(buffer, "  %s = saturate(%s ? %s : %s);\n", writeTarget(op1), condition.c_str(), ci(op3).c_str(), ci(op4).c_str());
 						appendOutput(buffer);
 
 						//int idx = 0;
@@ -6001,10 +6020,10 @@ public:
 
 					case OPCODE_IF:
 						applySwizzle(".x", op1);
-						if (instr->eBooleanTestType == INSTRUCTION_TEST_ZERO)
-							sprintf(buffer, "  if (%s == 0) {\n", ci(op1).c_str());
-						else
-							sprintf(buffer, "  if (%s != 0) {\n", ci(op1).c_str());
+						{
+							string condition = conditionExpression(op1, instr->eBooleanTestType == INSTRUCTION_TEST_ZERO);
+							sprintf(buffer, "  if %s {\n", condition.c_str());
+						}
 						appendOutput(buffer);
 						break;
 					case OPCODE_ELSE:
@@ -6026,10 +6045,10 @@ public:
 						break;
 					case OPCODE_BREAKC:
 						applySwizzle(".x", op1);
-						if (instr->eBooleanTestType == INSTRUCTION_TEST_ZERO)
-							sprintf(buffer, "  if (%s == 0) break;\n", ci(op1).c_str());
-						else
-							sprintf(buffer, "  if (%s != 0) break;\n", ci(op1).c_str());
+						{
+							string condition = conditionExpression(op1, instr->eBooleanTestType == INSTRUCTION_TEST_ZERO);
+							sprintf(buffer, "  if %s break;\n", condition.c_str());
+						}
 						appendOutput(buffer);
 						break;
 					case OPCODE_CONTINUE:
@@ -6038,10 +6057,10 @@ public:
 						break;
 					case OPCODE_CONTINUEC:
 						applySwizzle(".x", op1);
-						if (instr->eBooleanTestType == INSTRUCTION_TEST_ZERO)
-							sprintf(buffer, "  if (%s == 0) continue;\n", ci(op1).c_str());
-						else
-							sprintf(buffer, "  if (%s != 0) continue;\n", ci(op1).c_str());
+						{
+							string condition = conditionExpression(op1, instr->eBooleanTestType == INSTRUCTION_TEST_ZERO);
+							sprintf(buffer, "  if %s continue;\n", condition.c_str());
+						}
 						appendOutput(buffer);
 						break;
 					case OPCODE_ENDLOOP:
@@ -6529,10 +6548,10 @@ public:
 
 					case OPCODE_DISCARD:
 						applySwizzle(".x", op1);
-						if (instr->eBooleanTestType == INSTRUCTION_TEST_ZERO)
-							sprintf(buffer, "  if (%s == 0) discard;\n", ci(op1).c_str());
-						else
-							sprintf(buffer, "  if (%s != 0) discard;\n", ci(op1).c_str());
+						{
+							string condition = conditionExpression(op1, instr->eBooleanTestType == INSTRUCTION_TEST_ZERO);
+							sprintf(buffer, "  if %s discard;\n", condition.c_str());
+						}
 						appendOutput(buffer);
 						break;
 
@@ -6788,10 +6807,10 @@ public:
 						// Missing opcode needed for WatchDogs. Used as "retc_nz r0.x"
 					case OPCODE_RETC:
 						applySwizzle(".x", op1);
-						if (instr->eBooleanTestType == INSTRUCTION_TEST_ZERO)
-							sprintf(buffer, "  if (%s == 0) return;\n", ci(op1).c_str());
-						else
-							sprintf(buffer, "  if (%s != 0) return;\n", ci(op1).c_str());
+						{
+							string condition = conditionExpression(op1, instr->eBooleanTestType == INSTRUCTION_TEST_ZERO);
+							sprintf(buffer, "  if %s return;\n", condition.c_str());
+						}
 						appendOutput(buffer);
 						break;
 
@@ -6881,16 +6900,16 @@ public:
 			"\n\n"
 			"// 3Dmigoto declarations\n";
 
-		// Also inject the helper macro of 'cmp' to fix any boolean comparisons.
-		// This is a bit of a hack, but simply adds a "-" in front of the comparison,
-		// which negates the bool comparison from 1:0 to -1:0. 
-		//    r0.y = cmp(0 < r0.x);   becomes
-		//    r0.y = -(0 < r0.x);
-		// This allows us to avoid having helper routines, and needing different
-		// variants for different swizzle sizes, like .xy or .xyz.
-
+		// DXBC comparisons produce an all-bits mask (0xffffffff or 0), not the
+		// HLSL numeric values 1 and 0.  Keep that mask when it is stored in the
+		// float-shaped temporary registers.  The overloads avoid relying on an
+		// implicit bool-to-float conversion, which would lose the mask bits.
 		declaration +=
-			"#define cmp -\n";
+			"uint cmp_mask(bool v) { return v ? 0xffffffffu : 0u; }\n"
+			"uint2 cmp_mask(bool2 v) { return uint2(v.x ? 0xffffffffu : 0u, v.y ? 0xffffffffu : 0u); }\n"
+			"uint3 cmp_mask(bool3 v) { return uint3(v.x ? 0xffffffffu : 0u, v.y ? 0xffffffffu : 0u, v.z ? 0xffffffffu : 0u); }\n"
+			"uint4 cmp_mask(bool4 v) { return uint4(v.x ? 0xffffffffu : 0u, v.y ? 0xffffffffu : 0u, v.z ? 0xffffffffu : 0u, v.w ? 0xffffffffu : 0u); }\n"
+			"#define cmp(x) asfloat(cmp_mask(x))\n";
 
 		if (G->IniParamsReg >= 0) {
 			declaration +=
