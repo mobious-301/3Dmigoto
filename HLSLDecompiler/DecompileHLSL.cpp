@@ -7358,8 +7358,9 @@ public:
 								char dest[opcodeSize] = "uiDest.xyzw";
 								applySwizzle(op3, dest);
 								applySwizzle(op1, dest);
-								sprintf(buffer, "  %s = %s;\n", op1, dest);
+								sprintf(buffer, "  %s = asfloat(%s);\n", op1, dest);
 								appendOutput(buffer);
+								markIntegerBitPatternComponents(op1);
 							}
 							else
 							{
