@@ -3667,7 +3667,7 @@ public:
 	}
 
 	bool translate_structured_var(Shader *shader, const char *c, size_t &pos, size_t &size, Instruction *instr,
-			std::string ret[4], bool *combined, char *idx, char *off, char *reg, Operand *texture, int swiz_offsets[4])
+			std::string ret[4], bool *combined, bool *fakeType, char *idx, char *off, char *reg, Operand *texture, int swiz_offsets[4])
 	{
 		Operand dst0 = instr->asOperands[0];
 		ResourceGroup group = (ResourceGroup)-1;
@@ -3678,6 +3678,7 @@ public:
 		applySwizzle(".x", off);
 
 		*combined = false;
+		*fakeType = false;
 
 		if (reg[0] == 't')
 			group = RGROUP_TEXTURE;
@@ -3785,6 +3786,7 @@ public:
 		}
 		else
 		{
+			*fakeType = true;
 			// Missing reflection information - we have to use our fake
 			// type information instead. Our fake type information is
 			// an array of floats for the greatest compatibility with
@@ -3888,11 +3890,11 @@ public:
 			}
 		}
 
-		if (translate_structured_var(shader, c, pos, size, instr, translated, &combined, idx, off, reg, &texture, swiz_offsets)) {
+		if (translate_structured_var(shader, c, pos, size, instr, translated, &combined, &fakeType, idx, off, reg, &texture, swiz_offsets)) {
 			if (combined) {
 				sprintf(buffer, "  %s = %s;\n", writeTarget(dst), translated[0].c_str());
 				appendOutput(buffer);
-			} else {
+			} else if (fakeType) {
 				string expression;
 				int componentCount = 0;
 				for (int component = 0; component < 4; component++) {
@@ -3907,6 +3909,17 @@ public:
 					expression = "float" + to_string(componentCount) + "(" + expression + ")";
 				sprintf(buffer, "  %s = %s;\n", writeTarget(dst), expression.c_str());
 				appendOutput(buffer);
+			} else {
+				stripMask(dst);
+				for (int component = 0; component < 4; component++) {
+					if (!(dst0.ui32CompMask & (1 << component)))
+						continue;
+					sprintf(buffer, "  %s.%c = %s;\n",
+							writeTarget(dst),
+							component == 3 ? 'w' : 'x' + component,
+							translated[component].c_str());
+					appendOutput(buffer);
+				}
 			}
 		}
 
@@ -3918,6 +3931,7 @@ public:
 		std::string translated[4];
 		char buffer[512];
 		bool combined;
+		bool fakeType;
 
 		// store_structured u1.x, v0.x, l(0), v1.x
 		char *dst = op1, *idx = op2, *off = op3, *src = op4;
@@ -3927,7 +3941,7 @@ public:
 		remapTarget(dst);
 		int swiz_offsets[4] = {0, 4, 8, 12};
 
-		if (translate_structured_var(shader, c, pos, size, instr, translated, &combined, idx, off, dst, &dst0, swiz_offsets)) {
+		if (translate_structured_var(shader, c, pos, size, instr, translated, &combined, &fakeType, idx, off, dst, &dst0, swiz_offsets)) {
 			if (combined) {
 				applySwizzle(dst, src);
 				sprintf(buffer, "  %s = %s;\n", translated[0].c_str(), ci(src).c_str());
