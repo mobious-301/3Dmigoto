@@ -3789,10 +3789,9 @@ public:
 			// type information instead. Our fake type information is
 			// an array of floats for the greatest compatibility with
 			// any possible stride value that StructuredBuffers may posess,
-			// but that means we have to break up instructions to assign
-			// each component in the mask separately, adjusting the offset
-			// based on the swizzle. TODO: We could recombine them using
-			// a floatN(x,y,z,w); construct. We can't fix up types that
+			// but that means we have to calculate each component in the mask
+			// separately, adjusting the offset based on the swizzle.
+			// We can't fix up types that
 			// aren't floats here, because we won't know what types they
 			// are until they are used - ideally we should switch to a
 			// model that uses asfloat/asint where non-floats are used
@@ -3832,6 +3831,7 @@ public:
 		std::string translated[4];
 		char buffer[512];
 		bool combined;
+		bool fakeType;
 
 		// New variant found in Mordor.  Example:
 		//   gInstanceBuffer                   texture  struct         r/o    0        1
@@ -3893,16 +3893,20 @@ public:
 				sprintf(buffer, "  %s = %s;\n", writeTarget(dst), translated[0].c_str());
 				appendOutput(buffer);
 			} else {
-				stripMask(dst);
+				string expression;
+				int componentCount = 0;
 				for (int component = 0; component < 4; component++) {
 					if (!(dst0.ui32CompMask & (1 << component)))
 						continue;
-					sprintf(buffer, "  %s.%c = %s;\n",
-							writeTarget(dst),
-							component == 3 ? 'w' : 'x' + component,
-							translated[component].c_str());
-					appendOutput(buffer);
+					if (!expression.empty())
+						expression += ", ";
+					expression += translated[component];
+					++componentCount;
 				}
+				if (componentCount > 1)
+					expression = "float" + to_string(componentCount) + "(" + expression + ")";
+				sprintf(buffer, "  %s = %s;\n", writeTarget(dst), expression.c_str());
+				appendOutput(buffer);
 			}
 		}
 
